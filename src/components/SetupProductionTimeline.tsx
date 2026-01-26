@@ -1815,7 +1815,7 @@ export default function SetupProductionTimeline({ onClose }: SetupProductionTime
     if (!production || production.heads.length >= systemSettings.maxHeadSlots) return;
     
     const headCount = production.heads.length;
-    const defaultColor = COLOR_PRESETS[headCount % COLOR_PRESETS.length].value;
+    const defaultColor = production.color;
     
     const newHead: ProductionHead = {
       id: generateId(),
@@ -1870,7 +1870,7 @@ export default function SetupProductionTimeline({ onClose }: SetupProductionTime
     if (!head) return;
     
     const subCount = head.subHeads.filter(s => !s.isCutoff).length;
-    const defaultColor = COLOR_PRESETS[(subCount + 1) % COLOR_PRESETS.length].value;
+    const defaultColor = head.color;
     
     const newSub: SubHead = {
       id: generateId(),
@@ -2226,7 +2226,7 @@ export default function SetupProductionTimeline({ onClose }: SetupProductionTime
           totalMinutes: h.t || 60,
           startTime: h.st || '08:00',
           endTime: h.et || '09:00',
-          color: h.c || '#10b981',
+          color: h.c || p.c || '#10b981',
           status: h.st2 || '',
           expanded: true,
           showDowntimeGraph: h.sdg === 1,
@@ -2256,7 +2256,7 @@ export default function SetupProductionTimeline({ onClose }: SetupProductionTime
             id: generateId(),
             name: sc.n || 'Sub',
             isCutoff: sc.cut === 1,
-            color: sc.c || '#10b981',
+            color: sc.c || h.c || p.c || '#10b981',
             status: sc.st || '',
             visible: false,
             expanded: true,
@@ -2268,7 +2268,7 @@ export default function SetupProductionTimeline({ onClose }: SetupProductionTime
                   endTime: int[1] || '00:00',
                   startMin: timeToMinutes(int[0] || '00:00'),
                   endMin: timeToMinutes(int[1] || '00:00'),
-                  color: int[2] || sc.c || '#10b981'
+                  color: int[2] || sc.c || h.c || p.c || '#10b981'
                 };
               } else {
                 return {
@@ -2277,7 +2277,7 @@ export default function SetupProductionTimeline({ onClose }: SetupProductionTime
                   endMin: int[1] || 0,
                   startTime: minutesToTime(int[0] || 0),
                   endTime: minutesToTime(int[1] || 0),
-                  color: int[2] || sc.c || '#10b981'
+                  color: int[2] || sc.c || h.c || p.c || '#10b981'
                 };
               }
             })

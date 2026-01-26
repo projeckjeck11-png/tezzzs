@@ -175,6 +175,10 @@ export function ProductionKpiPanel({
     ? Math.max(0, plannedWindowMins - downtimeMinsCapped) / plannedWindowMins
     : 0;
   const netRunningMins = Math.max(0, actualTimeMins);
+  const performanceTimeMins = timeContext === "production_plus_downtime"
+    ? actualTimeForKpiMins
+    : netRunningMins;
+  const performanceCycles = safeDiv(performanceTimeMins, plannedCycleTimeMins);
 
   // 2. UTILIZATION (Capacity Usage)
   // = Actual Running Time / (Planned Time + Actual Downtime)
@@ -191,12 +195,12 @@ export function ProductionKpiPanel({
   // 4. PERFORMANCE RATE (OEE Component)
   // = (Actual Output × Ideal Cycle Time) / Operating Time
   // Measures actual output vs theoretical max output
-  const theoreticalOutputAtSpeed = netRunningMins > 0 && idealOutputPerCycle > 0
-    ? (netRunningMins / plannedCycleTimeMins) * idealOutputPerCycle
+  const theoreticalOutputAtSpeed = performanceTimeMins > 0 && idealOutputPerCycle > 0
+    ? (performanceTimeMins / plannedCycleTimeMins) * idealOutputPerCycle
     : 0;
   const performanceRate = theoreticalOutputAtSpeed > 0
     ? Math.min(safeDiv(actualOutput, theoreticalOutputAtSpeed), 1.5) // Cap at 150% to avoid crazy numbers
-    : safeDiv(actualOutput, completedCycles > 0 ? completedCycles * (idealOutputPerCycle || 1) : 1);
+    : safeDiv(actualOutput, performanceCycles > 0 ? performanceCycles * (idealOutputPerCycle || 1) : 1);
 
   // 5. QUALITY RATE
   // = Good Output / Total Output
@@ -1090,6 +1094,13 @@ export function ProductionKpiPanel({
                     <div className="mt-2 p-2 bg-muted/30 rounded text-[10px]">
                       <div>= (Planned + Budget - Downtime) ÷ (Planned + Budget)</div>
                       <div>= {pct(availability)}</div>
+                      <div className="mt-2 border-t border-border/50 pt-2">
+                        <div>Planned = {formatTime(plannedTimeMins)}</div>
+                        <div>Budget = {formatTime(downtimeBudgetCap)}</div>
+                        <div>Downtime = {formatTime(downtimeMinsCapped)}</div>
+                        <div>Operating = {formatTime(Math.max(0, plannedWindowMins - downtimeMinsCapped))}</div>
+                        <div>A = {formatTime(Math.max(0, plannedWindowMins - downtimeMinsCapped))} / {formatTime(plannedWindowMins)} = {pct(availability)}</div>
+                      </div>
                     </div>
                   </div>
                 }
@@ -1110,6 +1121,25 @@ export function ProductionKpiPanel({
                     <div className="mt-2 p-2 bg-muted/30 rounded text-[10px]">
                       <div>= Actual Output ÷ Theoretical Max</div>
                       <div>= {pct(Math.min(performanceRate, 1))}</div>
+                      <div className="mt-2 border-t border-border/50 pt-2">
+                        <div>Actual Output = {actualOutput}</div>
+                        {theoreticalOutputAtSpeed > 0 ? (
+                          <>
+                            <div>
+                              Theoretical Max = ({formatTime(performanceTimeMins)} / {formatTime(plannedCycleTimeMins)}) * {idealOutputPerCycle} = {theoreticalOutputAtSpeed.toFixed(2)}
+                            </div>
+                            <div>Raw P = {actualOutput} / {theoreticalOutputAtSpeed.toFixed(2)} = {pct(performanceRate)}</div>
+                          </>
+                        ) : (
+                          <>
+                            <div>Cycles = {performanceCycles.toFixed(2)}</div>
+                            <div>Ideal Output/Cycle = {idealOutputPerCycle || 1}</div>
+                            <div>Theoretical Max = {performanceCycles.toFixed(2)} * {idealOutputPerCycle || 1} = {(performanceCycles * (idealOutputPerCycle || 1)).toFixed(2)}</div>
+                            <div>Raw P = {actualOutput} / {(performanceCycles > 0 ? performanceCycles * (idealOutputPerCycle || 1) : 1).toFixed(2)} = {pct(performanceRate)}</div>
+                          </>
+                        )}
+                        <div>OEE P (capped) = {pct(Math.min(performanceRate, 1))}</div>
+                      </div>
                     </div>
                     <div className="mt-2 text-[10px] text-muted-foreground">
                       Catatan: Performance capped di 100% untuk kalkulasi OEE.
@@ -1133,6 +1163,17 @@ export function ProductionKpiPanel({
                     <div className="mt-2 p-2 bg-muted/30 rounded text-[10px]">
                       <div>= Good Output ÷ Total Output</div>
                       <div>= {goodOutput} ÷ {actualOutput} = {pct(qualityRate)}</div>
+                    </div>
+                    <div className="mt-2 border-t border-border/50 pt-2 text-[10px]">
+                      {actualOutput > 0 ? (
+                        <>
+                          <div>Good Output = {goodOutput}</div>
+                          <div>Total Output = {actualOutput}</div>
+                          <div>Q = {goodOutput} / {actualOutput} = {pct(qualityRate)}</div>
+                        </>
+                      ) : (
+                        <div>Total Output = 0, Quality default 100%</div>
+                      )}
                     </div>
                     <div className="mt-2 text-[10px] text-muted-foreground">
                       Default: Quality = 100% (semua output dianggap bagus).

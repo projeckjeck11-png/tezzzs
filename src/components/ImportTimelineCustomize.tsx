@@ -1029,7 +1029,7 @@ export function ImportTimelineCustomize({ onClose }: ImportTimelineCustomizeProp
 
   // Add new head channel
   const addHeadChannel = () => {
-    const defaultColor = COLOR_PRESETS[headChannels.length % COLOR_PRESETS.length].value;
+    const defaultColor = COLOR_PRESETS[0]?.value || '#10b981';
     const newHead: ImportHeadChannel = {
       id: generateId(),
       name: `Head ${headChannels.length + 1}`,
@@ -1074,7 +1074,7 @@ export function ImportTimelineCustomize({ onClose }: ImportTimelineCustomizeProp
     if (!head) return;
     
     const subCount = head.subChannels.filter(s => !s.isCutoff).length;
-    const defaultColor = COLOR_PRESETS[(subCount + 1) % COLOR_PRESETS.length].value;
+    const defaultColor = head.color || COLOR_PRESETS[0]?.value || '#10b981';
     const subId = generateId();
     
     setHeadChannels(headChannels.map(h => {
