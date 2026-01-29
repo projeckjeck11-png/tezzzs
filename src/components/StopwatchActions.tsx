@@ -4,6 +4,7 @@ import { toast } from 'sonner';
 import { HeadChannel } from '@/types';
 import { buildStopwatchTimelineJson } from '@/lib/stopwatchTimelineJson';
 import { getElapsedMs } from '@/lib/timeFormat';
+import { saveTextFile, openTextFile } from '@/lib/textFile';
 
 interface StopwatchActionsProps {
   headChannels: HeadChannel[];
@@ -49,7 +50,7 @@ export function StopwatchActions({ headChannels, onImportChannels }: StopwatchAc
 
   const hasChannels = headChannels.length > 0;
 
-  // Save JSON to clipboard
+  // Save JSON to TXT file
   const handleSaveJson = async () => {
     if (!hasChannels) {
       toast.error('No head channels to save');
@@ -58,18 +59,38 @@ export function StopwatchActions({ headChannels, onImportChannels }: StopwatchAc
 
     try {
       const json = buildStopwatchTimelineJson(headChannels);
-      await navigator.clipboard.writeText(json);
-      toast.success('JSON copied to clipboard!');
+      const result = await saveTextFile(json, 'stopwatch-timeline.txt');
+      if (result.ok) {
+        toast.success('File saved');
+      } else if (result.reason === 'unsupported') {
+        toast.error('File save is not supported in this environment');
+      } else if (result.reason === 'error') {
+        toast.error('Failed to save file');
+        console.error(result.error);
+      }
     } catch {
-      toast.error('Failed to copy JSON');
+      toast.error('Failed to save file');
     }
   };
 
-  // Import JSON from prompt dialog
-  const handleImportJson = () => {
-    const input = window.prompt(
-      'Paste JSON data:\n\nFormat: [{"n":"Head 1","t":60,"s":[{"n":"Sub 1","c":0,"i":[[0,5]]}]}]'
-    );
+  // Import JSON from TXT file (fallback to paste if unsupported)
+  const handleImportJson = async () => {
+    const fileResult = await openTextFile();
+    let input: string | null = null;
+
+    if (fileResult.ok) {
+      input = fileResult.text;
+    } else if (fileResult.reason === 'unsupported') {
+      input = window.prompt(
+        'Paste JSON data:\n\nFormat: [{"n":"Head 1","t":60,"s":[{"n":"Sub 1","c":0,"i":[[0,5]]}]}]'
+      );
+    } else if (fileResult.reason === 'error') {
+      toast.error('Failed to open file');
+      console.error(fileResult.error);
+      return;
+    } else {
+      return;
+    }
 
     if (input === null) {
       return; // User cancelled
@@ -293,25 +314,25 @@ export function StopwatchActions({ headChannels, onImportChannels }: StopwatchAc
     <>
       {/* Stopwatch Sub-Actions */}
       <div className="flex flex-wrap items-center justify-center gap-2">
-        {/* Save JSON */}
+      {/* Save TXT */}
         <button
           className="flex items-center gap-1.5 py-2 px-3.5 rounded-lg text-sm font-medium transition-all active:scale-[0.98] bg-emerald-500 text-white hover:bg-emerald-600 disabled:opacity-50 disabled:cursor-not-allowed"
           onClick={handleSaveJson}
           disabled={!hasChannels}
-          title="Save JSON to clipboard"
+          title="Save TXT file"
         >
           <Save className="w-4 h-4" />
-          Save JSON
+          Save TXT
         </button>
 
-        {/* Import JSON */}
+      {/* Import TXT */}
         <button
           className="flex items-center gap-1.5 py-2 px-3.5 rounded-lg text-sm font-medium transition-all active:scale-[0.98] bg-blue-500 text-white hover:bg-blue-600"
           onClick={handleImportJson}
-          title="Import JSON from clipboard"
+          title="Import TXT file"
         >
           <Upload className="w-4 h-4" />
-          Import JSON
+          Import TXT
         </button>
 
         {/* Export Summary */}

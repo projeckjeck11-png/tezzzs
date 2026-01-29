@@ -4,6 +4,9 @@ import { toast } from 'sonner';
 import { CursorTooltip } from '@/components/CursorTooltip';
 import { PieChart, Pie, Cell, Tooltip, ResponsiveContainer, BarChart, Bar, XAxis, YAxis, CartesianGrid } from 'recharts';
 import { ProductionKpiPanel, type ProductionKpiConfig } from '@/components/ProductionKpiPanel';
+import { saveTextFile, openTextFile } from '@/lib/textFile';
+import { FullscreenChart } from '@/components/FullscreenChart';
+import { VisualizationErrorBoundary } from '@/components/VisualizationErrorBoundary';
 
 // Color presets for customization
 const COLOR_PRESETS = [
@@ -138,8 +141,12 @@ function generateId(): string {
   return `${Date.now()}-${Math.random().toString(36).slice(2, 9)}`;
 }
 
-function timeToMinutes(time: string): number {
-  const [hours, minutes] = time.split(':').map(Number);
+function timeToMinutes(time?: string): number {
+  if (!time || !time.includes(':')) return 0;
+  const [hoursRaw, minutesRaw] = time.split(':');
+  const hours = Number(hoursRaw);
+  const minutes = Number(minutesRaw);
+  if (!Number.isFinite(hours) || !Number.isFinite(minutes)) return 0;
   return hours * 60 + minutes;
 }
 
@@ -274,6 +281,7 @@ function DowntimeTimelineGraph({ head, headName, netHeadDurationMins, mode, visu
   const vs = visualSettings;
   const categories = systemSettings.downtimeCategories;
   const budgetMins = systemSettings.downtimeBudgetMins;
+  const downtimeItems = head.downtimeItems ?? [];
   
   // Use net head duration for all calculations and display (after cutoff applied)
   let offsetMins = 0;
@@ -287,10 +295,10 @@ function DowntimeTimelineGraph({ head, headName, netHeadDurationMins, mode, visu
   // Use net duration for timeline scale (after cutoff)
   const displayDurationMins = netHeadDurationMins;
   
-  if (netHeadDurationMins <= 0 || head.downtimeItems.length === 0) return null;
+  if (netHeadDurationMins <= 0 || downtimeItems.length === 0) return null;
   
   // Calculate total downtime
-  const totalDowntimeMins = head.downtimeItems.reduce((acc, item) => acc + (item.endMin - item.startMin), 0);
+  const totalDowntimeMins = downtimeItems.reduce((acc, item) => acc + (item.endMin - item.startMin), 0);
   
   // Calculate percentages
   const pctOfHead = netHeadDurationMins > 0 ? (totalDowntimeMins / netHeadDurationMins) * 100 : 0;
@@ -331,13 +339,14 @@ function DowntimeTimelineGraph({ head, headName, netHeadDurationMins, mode, visu
   }
 
   return (
-    <div 
-      className="bg-gradient-to-b from-amber-950/80 to-amber-950/60 border border-amber-500/50 rounded-xl"
-      style={{ 
-        padding: vs.containerPadding,
-        borderRadius: vs.borderRadius 
-      }}
-    >
+    <FullscreenChart title={`Downtime Timeline: ${headName}`}>
+      <div 
+        className="bg-gradient-to-b from-amber-950/80 to-amber-950/60 border border-amber-500/50 rounded-xl"
+        style={{ 
+          padding: vs.containerPadding,
+          borderRadius: vs.borderRadius 
+        }}
+      >
       {/* Header */}
       <div className="flex items-center justify-between mb-1 flex-wrap gap-2">
         <div className="flex items-center gap-2">
@@ -438,7 +447,7 @@ function DowntimeTimelineGraph({ head, headName, netHeadDurationMins, mode, visu
                   opacity: vs.barOpacity / 100
                 }}
               >
-                {head.downtimeItems.map((item) => {
+                {downtimeItems.map((item) => {
                   const category = categories.find(c => c.id === item.categoryId) || categories[0];
                   // Position based on item's time range relative to head - use displayDurationMins for scale
                   const itemStartRelative = (mode === 'oclock' ? item.startMin - offsetMins : item.startMin - offsetMins);
@@ -520,9 +529,9 @@ function DowntimeTimelineGraph({ head, headName, netHeadDurationMins, mode, visu
           </div>
 
           {/* Individual type bars */}
-          {categories.map(category => {
-            const typeItems = head.downtimeItems.filter(d => d.categoryId === category.id);
-            if (typeItems.length === 0) return null;
+            {categories.map(category => {
+              const typeItems = downtimeItems.filter(d => d.categoryId === category.id);
+              if (typeItems.length === 0) return null;
             
             const typeTotalMins = typeItems.reduce((acc, d) => acc + (d.endMin - d.startMin), 0);
             
@@ -586,7 +595,7 @@ function DowntimeTimelineGraph({ head, headName, netHeadDurationMins, mode, visu
       <div className="flex items-center justify-between text-[10px] pt-2 border-t border-amber-500/20">
         <div className="flex items-center gap-3 flex-wrap">
           {categories.map(category => {
-            const typeTotal = head.downtimeItems.filter(d => d.categoryId === category.id).reduce((a, d) => a + (d.endMin - d.startMin), 0);
+            const typeTotal = downtimeItems.filter(d => d.categoryId === category.id).reduce((a, d) => a + (d.endMin - d.startMin), 0);
             if (typeTotal === 0) return null;
             return (
               <div key={category.id} className="flex items-center gap-1">
@@ -600,7 +609,8 @@ function DowntimeTimelineGraph({ head, headName, netHeadDurationMins, mode, visu
           Budget: {formatWithUnit(systemSettings.downtimeBudgetMins)}
         </div>
       </div>
-    </div>
+      </div>
+    </FullscreenChart>
   );
 }
 
@@ -617,9 +627,11 @@ interface HeadTimelineVisualizationProps {
 
 function HeadTimelineVisualization({ head, mode, showCutoff, visualSettings, systemSettings, showDowntimeGraph, cycleTimeMins }: HeadTimelineVisualizationProps) {
   const vs = visualSettings;
-  
+  const subHeads = head.subHeads ?? [];
+  const downtimeItems = head.downtimeItems ?? [];
+    
   // Calculate cutoffs first
-  const cutoffSubs = head.subHeads.filter(s => s.isCutoff);
+  const cutoffSubs = subHeads.filter(s => s.isCutoff);
   const totalCutoffMins = cutoffSubs.reduce((acc, sub) => 
     acc + sub.intervals.reduce((a, int) => a + getDurationMinutes(int.startMin, int.endMin), 0), 0);
   
@@ -643,7 +655,7 @@ function HeadTimelineVisualization({ head, mode, showCutoff, visualSettings, sys
 
   // Find max end time from all sub-heads
   let maxSubEndMins = 0;
-  head.subHeads.forEach(sub => {
+  subHeads.forEach(sub => {
     sub.intervals.forEach(interval => {
       const relativeEnd = mode === 'oclock' ? interval.endMin - offsetMins : interval.endMin - offsetMins;
       maxSubEndMins = Math.max(maxSubEndMins, relativeEnd);
@@ -693,14 +705,15 @@ function HeadTimelineVisualization({ head, mode, showCutoff, visualSettings, sys
   }
 
   return (
-    <div 
-      className="bg-gradient-to-b from-card to-card/80 rounded-xl border border-border/50 backdrop-blur-sm"
-      style={{ 
-        padding: vs.containerPadding,
-        borderRadius: vs.borderRadius,
-        boxShadow: vs.showShadow ? '0 4px 6px -1px rgba(0, 0, 0, 0.1)' : 'none'
-      }}
-    >
+    <FullscreenChart title={`${head.name} Timeline`}>
+      <div 
+        className="bg-gradient-to-b from-card to-card/80 rounded-xl border border-border/50 backdrop-blur-sm"
+        style={{ 
+          padding: vs.containerPadding,
+          borderRadius: vs.borderRadius,
+          boxShadow: vs.showShadow ? '0 4px 6px -1px rgba(0, 0, 0, 0.1)' : 'none'
+        }}
+      >
       {/* Header with time range */}
       <div className="flex items-center justify-between mb-0.5">
         <div className="flex items-center gap-2">
@@ -867,7 +880,7 @@ function HeadTimelineVisualization({ head, mode, showCutoff, visualSettings, sys
           </div>
 
           {/* Sub-heads bars */}
-          {head.subHeads.filter(s => !s.isCutoff).map((sub) => {
+          {subHeads.filter(s => !s.isCutoff).map((sub) => {
             const firstInt = sub.intervals[0];
             const lastInt = sub.intervals[sub.intervals.length - 1];
             const labelIndicatorColor = firstInt?.color || sub.color;
@@ -1016,7 +1029,7 @@ function HeadTimelineVisualization({ head, mode, showCutoff, visualSettings, sys
       </div>
       
       {/* Downtime Timeline Graph - Controlled by global toggle */}
-      {showDowntimeGraph && head.downtimeItems.length > 0 && (
+      {showDowntimeGraph && downtimeItems.length > 0 && (
         <div className="mt-3">
           <DowntimeTimelineGraph 
             head={head}
@@ -1029,7 +1042,8 @@ function HeadTimelineVisualization({ head, mode, showCutoff, visualSettings, sys
           />
         </div>
       )}
-    </div>
+      </div>
+    </FullscreenChart>
   );
 }
 
@@ -1173,7 +1187,8 @@ function AnalyticsChart({
   };
 
   return (
-    <div className={`bg-gradient-to-b from-card to-card/80 rounded-xl border p-4 ${isOver ? 'border-red-500/50 bg-red-500/5' : 'border-border/50'}`}>
+    <FullscreenChart title={title}>
+      <div className={`bg-gradient-to-b from-card to-card/80 rounded-xl border p-4 ${isOver ? 'border-red-500/50 bg-red-500/5' : 'border-border/50'}`}>
       <div className="flex items-center justify-between mb-3">
         <h4 className="text-sm font-semibold text-foreground flex items-center gap-2">
           {icon || <Factory className="w-4 h-4" style={{ color: accentColor }} />}
@@ -1218,7 +1233,8 @@ function AnalyticsChart({
           ))}
         </div>
       </div>
-    </div>
+      </div>
+    </FullscreenChart>
   );
 }
 
@@ -1274,7 +1290,8 @@ function DowntimeBudgetProgressChart({
   });
 
   return (
-    <div className={`bg-gradient-to-br from-slate-900 via-slate-800 to-slate-900 rounded-2xl border-2 p-5 shadow-2xl backdrop-blur-sm ${isOverBudget ? 'border-red-500/60' : 'border-white/10'}`}>
+    <FullscreenChart title="Downtime vs Budget" fillWidth={false} contentClassName="max-w-lg w-full">
+      <div className={`bg-gradient-to-br from-slate-900 via-slate-800 to-slate-900 rounded-2xl border-2 p-5 shadow-2xl backdrop-blur-sm ${isOverBudget ? 'border-red-500/60' : 'border-white/10'}`}>
       <div className="flex items-center justify-between mb-5">
         <h4 className="text-base font-bold text-white flex items-center gap-2.5">
           <div className="w-8 h-8 rounded-xl bg-gradient-to-br from-amber-400 to-orange-500 flex items-center justify-center shadow-lg">
@@ -1422,7 +1439,8 @@ function DowntimeBudgetProgressChart({
           </div>
         </div>
       </div>
-    </div>
+      </div>
+    </FullscreenChart>
   );
 }
 
@@ -2004,15 +2022,17 @@ export default function SetupProductionTimeline({ onClose }: SetupProductionTime
   };
 
   // Calculate total downtime for a production (now using ranges)
-  const getProductionDowntime = (production: MainProduction): { byCategory: { categoryId: string; minutes: number; color: string; name: string }[]; total: number } => {
-    const categoryTotals = new Map<string, number>();
-    
-    production.heads.forEach(head => {
-      head.downtimeItems.forEach(item => {
-        const itemDuration = item.endMin - item.startMin;
-        categoryTotals.set(item.categoryId, (categoryTotals.get(item.categoryId) || 0) + itemDuration);
+    const getProductionDowntime = (production: MainProduction): { byCategory: { categoryId: string; minutes: number; color: string; name: string }[]; total: number } => {
+      const categoryTotals = new Map<string, number>();
+      const heads = production.heads ?? [];
+      
+      heads.forEach(head => {
+        const items = head.downtimeItems ?? [];
+        items.forEach(item => {
+          const itemDuration = item.endMin - item.startMin;
+          categoryTotals.set(item.categoryId, (categoryTotals.get(item.categoryId) || 0) + itemDuration);
+        });
       });
-    });
 
     const byCategory = systemSettings.downtimeCategories.map(cat => ({
       categoryId: cat.id,
@@ -2091,8 +2111,8 @@ export default function SetupProductionTimeline({ onClose }: SetupProductionTime
     });
   };
 
-  // Save to compact JSON
-  const saveToJson = () => {
+  // Save to compact JSON (TXT file)
+  const saveToJson = async () => {
     if (mainProductions.length === 0) {
       toast.error('No data to save');
       return;
@@ -2149,16 +2169,34 @@ export default function SetupProductionTimeline({ onClose }: SetupProductionTime
       }))
     };
     const jsonStr = JSON.stringify(data);
-    navigator.clipboard.writeText(jsonStr).then(() => {
-      toast.success('Data copied to clipboard!');
-    }).catch(() => {
-      toast.error('Failed to copy to clipboard');
-    });
+    const result = await saveTextFile(jsonStr, 'production-timeline.txt');
+    if (result.ok) {
+      toast.success('File saved');
+    } else if (result.reason === 'unsupported') {
+      toast.error('File save is not supported in this environment');
+    } else if (result.reason === 'error') {
+      toast.error('Failed to save file');
+      console.error(result.error);
+    }
   };
 
   // Import from JSON
-  const importFromJson = () => {
-    const input = prompt('Paste previously saved JSON data:');
+  const importFromJson = async () => {
+    const fileResult = await openTextFile();
+    let input: string | null = null;
+
+    if (fileResult.ok) {
+      input = fileResult.text;
+    } else if (fileResult.reason === 'unsupported') {
+      input = prompt('Paste previously saved JSON data:');
+    } else if (fileResult.reason === 'error') {
+      toast.error('Failed to open file');
+      console.error(fileResult.error);
+      return;
+    } else {
+      return;
+    }
+
     if (!input) return;
 
     const stripCodeFences = (s: string) =>
@@ -2579,7 +2617,7 @@ export default function SetupProductionTimeline({ onClose }: SetupProductionTime
                 className="flex items-center gap-1.5 px-3 py-1.5 bg-cyan-500/20 text-cyan-400 rounded-lg text-xs font-medium hover:bg-cyan-500/30 transition-colors border border-cyan-500/30"
               >
                 <Save className="w-3.5 h-3.5" />
-                Save JSON
+                Save TXT
               </button>
 
               <button
@@ -2597,7 +2635,7 @@ export default function SetupProductionTimeline({ onClose }: SetupProductionTime
             className="flex items-center gap-1.5 px-3 py-1.5 bg-muted text-muted-foreground rounded-lg text-xs font-medium hover:text-foreground hover:bg-muted/80 transition-colors"
           >
             <Upload className="w-3.5 h-3.5" />
-            Import JSON
+            Import TXT
           </button>
 
           {showVisualization && (
@@ -3143,6 +3181,7 @@ export default function SetupProductionTimeline({ onClose }: SetupProductionTime
 
       {/* Visualization Section */}
       {showVisualization && hasData && (
+        <VisualizationErrorBoundary title="Production visualization failed">
         <div ref={visualizationRef} className="mt-4 space-y-4">
           <div className="flex items-center justify-between flex-wrap gap-2">
             <h4 className="text-sm font-semibold text-foreground flex items-center gap-2">
@@ -3241,42 +3280,45 @@ export default function SetupProductionTimeline({ onClose }: SetupProductionTime
           </div>
 
           {/* Productions Visualization */}
-          {mainProductions.map((production) => {
-            const { byCategory: downtimeByCategory, total: totalDowntimeMins } = getProductionDowntime(production);
-            const headsCount = Math.max(1, production.heads.length);
-            
-            // Calculate actual cycle time from heads
-            // Calculate actual cycle time using NET durations (after cutoff for each head)
-            const totalNetAcrossHeadsMins = production.heads.reduce((acc, head) => {
-              // Get raw head duration
-              const rawHeadDuration = mode === 'oclock' 
-                ? timeToMinutes(head.endTime) - timeToMinutes(head.startTime)
-                : head.endMin - head.startMin;
+            {mainProductions.map((production) => {
+              const { byCategory: downtimeByCategory, total: totalDowntimeMins } = getProductionDowntime(production);
+              const heads = production.heads ?? [];
+              const headsCount = Math.max(1, heads.length);
               
-              // Calculate total cutoff for this head
-              const totalCutoffMins = head.subHeads
-                .filter(s => s.isCutoff)
-                .reduce((cAcc, cutoff) => {
-                  return cAcc + cutoff.intervals.reduce((iAcc, interval) => {
-                    return iAcc + (interval.endMin - interval.startMin);
+              // Calculate actual cycle time from heads
+              // Calculate actual cycle time using NET durations (after cutoff for each head)
+              const totalNetAcrossHeadsMins = heads.reduce((acc, head) => {
+                const subHeads = head.subHeads ?? [];
+                // Get raw head duration
+                const rawHeadDuration = mode === 'oclock' 
+                  ? timeToMinutes(head.endTime || '00:00') - timeToMinutes(head.startTime || '00:00')
+                  : head.endMin - head.startMin;
+                
+                // Calculate total cutoff for this head
+                const totalCutoffMins = subHeads
+                  .filter(s => s.isCutoff)
+                  .reduce((cAcc, cutoff) => {
+                    const intervals = cutoff.intervals ?? [];
+                    return cAcc + intervals.reduce((iAcc, interval) => {
+                      return iAcc + (interval.endMin - interval.startMin);
+                    }, 0);
                   }, 0);
-                }, 0);
-              
-              // Return net duration (raw - cutoff)
-              const netHeadDuration = Math.max(0, rawHeadDuration - totalCutoffMins);
-              return acc + netHeadDuration;
-            }, 0);
+                
+                // Return net duration (raw - cutoff)
+                const netHeadDuration = Math.max(0, rawHeadDuration - totalCutoffMins);
+                return acc + netHeadDuration;
+              }, 0);
 
             // Average actual net time per head (parallel heads)
             const actualNetTimeMins = totalNetAcrossHeadsMins / headsCount;
 
             // Raw actual time (includes cutoff)
-            const totalRawAcrossHeadsMins = production.heads.reduce((acc, head) => {
-              const rawHeadDuration = mode === 'oclock'
-                ? timeToMinutes(head.endTime) - timeToMinutes(head.startTime)
-                : head.endMin - head.startMin;
-              return acc + Math.max(0, rawHeadDuration);
-            }, 0);
+              const totalRawAcrossHeadsMins = heads.reduce((acc, head) => {
+                const rawHeadDuration = mode === 'oclock'
+                  ? timeToMinutes(head.endTime || '00:00') - timeToMinutes(head.startTime || '00:00')
+                  : head.endMin - head.startMin;
+                return acc + Math.max(0, rawHeadDuration);
+              }, 0);
 
             // Average actual raw time per head (parallel heads)
             const actualRawTimeMins = totalRawAcrossHeadsMins / headsCount;
@@ -3284,7 +3326,7 @@ export default function SetupProductionTimeline({ onClose }: SetupProductionTime
             // Planned cycle time is the IDEAL per-cycle time (not multiplied by heads)
             // If using individual cycle times, use the average across heads.
             const plannedCycleTimeMins = production.useIndividualCycleTimes
-              ? production.heads.reduce((acc, head) => acc + (head.individualCycleTime || production.cycleTime), 0) / headsCount
+              ? heads.reduce((acc, head) => acc + (head.individualCycleTime || production.cycleTime), 0) / headsCount
               : production.cycleTime;
 
             // Schedule-based planned time = average scheduled duration per head
@@ -3349,7 +3391,7 @@ export default function SetupProductionTimeline({ onClose }: SetupProductionTime
                       <AnalyticsChart
                         title={production.useIndividualCycleTimes 
                           ? `Downtime vs Cycle Time (${formatWithUnit(plannedCycleTimeMins)} total)`
-                          : `Downtime vs Cycle Time (${production.cycleTime}m × ${production.heads.length})`
+                          : `Downtime vs Cycle Time (${production.cycleTime}m � ${heads.length})`
                         }
                         baseDurationMins={plannedCycleTimeMins}
                         downtimeByCategory={downtimeByCategory}
@@ -3387,7 +3429,7 @@ export default function SetupProductionTimeline({ onClose }: SetupProductionTime
                 <ProductionKpiPanel
                   config={production.kpi}
                   onChange={(updates) => updateMainProduction(production.id, { kpi: { ...production.kpi, ...updates } })}
-                  headsCount={production.heads.length}
+                  headsCount={heads.length}
                   plannedCycleTimeMins={plannedCycleTimeMins}
                   plannedScheduleTimeMins={plannedScheduleTimeMins}
                   actualRawTimeMins={actualRawTimeMins}
@@ -3399,7 +3441,7 @@ export default function SetupProductionTimeline({ onClose }: SetupProductionTime
 
                 {/* Timeline Bars for each Head */}
                 <div className="space-y-3">
-                  {production.heads.map((head) => {
+                  {heads.map((head) => {
                     // Use individual cycle time if enabled, otherwise use global cycle time
                     const headCycleTime = production.useIndividualCycleTimes
                       ? (head.individualCycleTime || production.cycleTime)
@@ -3423,6 +3465,7 @@ export default function SetupProductionTimeline({ onClose }: SetupProductionTime
             );
           })}
         </div>
+        </VisualizationErrorBoundary>
       )}
 
       {/* Graph Settings Modal */}
@@ -3665,4 +3708,5 @@ export default function SetupProductionTimeline({ onClose }: SetupProductionTime
       )}
     </div>
   );
-}
+}
+

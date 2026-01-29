@@ -2,6 +2,7 @@ import { useMemo } from 'react';
 import { HeadChannel, SubChannelMark } from '@/types';
 import { formatTimeShort, getElapsedMs } from '@/lib/timeFormat';
 import { CursorTooltip } from '@/components/CursorTooltip';
+import { FullscreenChart } from '@/components/FullscreenChart';
 
 interface TimelineChartProps {
   headChannel: HeadChannel;
@@ -76,7 +77,8 @@ export function TimelineChart({ headChannel }: TimelineChartProps) {
   if (headChannel.subChannels.length === 0) return null;
 
   return (
-    <div className="mt-2 bg-gradient-to-b from-card to-card/80 rounded-xl p-2 shadow-lg border border-border/50 backdrop-blur-sm">
+    <FullscreenChart title={`${headChannel.name} Timeline`}>
+      <div className="mt-2 bg-gradient-to-b from-card to-card/80 rounded-xl p-2 shadow-lg border border-border/50 backdrop-blur-sm">
       {/* Compact header (match ImportTimelineOClock vibe) */}
       <div className="flex items-center justify-between mb-0.5">
         <h3 className="text-xs font-semibold text-foreground tracking-tight">
@@ -254,6 +256,7 @@ export function TimelineChart({ headChannel }: TimelineChartProps) {
           </div>
         </div>
       </div>
-    </div>
+      </div>
+    </FullscreenChart>
   );
 }

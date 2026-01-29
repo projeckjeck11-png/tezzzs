@@ -2,6 +2,9 @@ import { useState, useRef } from 'react';
 import { X, Plus, Trash2, Eye, EyeOff, ChevronDown, ChevronRight, Scissors, FileText, Clock, Save, Upload, Copy, Check } from 'lucide-react';
 import { toast } from 'sonner';
 import { CursorTooltip } from '@/components/CursorTooltip';
+import { saveTextFile, openTextFile } from '@/lib/textFile';
+import { FullscreenChart } from '@/components/FullscreenChart';
+import { VisualizationErrorBoundary } from '@/components/VisualizationErrorBoundary';
 interface TimelineInterval {
   id: string;
   startTime: string; // Format: "HH:MM"
@@ -30,8 +33,13 @@ function generateId(): string {
 }
 
 // Convert "HH:MM" to minutes from midnight
-function timeToMinutes(time: string): number {
-  const [hours, minutes] = time.split(':').map(Number);
+function timeToMinutes(time?: string | number | null): number {
+  if (typeof time === 'number') return Number.isFinite(time) ? time : 0;
+  if (!time || typeof time !== 'string' || !time.includes(':')) return 0;
+  const [hoursRaw, minutesRaw] = time.split(':');
+  const hours = Number(hoursRaw);
+  const minutes = Number(minutesRaw);
+  if (!Number.isFinite(hours) || !Number.isFinite(minutes)) return 0;
   return hours * 60 + minutes;
 }
 
@@ -191,22 +199,25 @@ function TimelineVisualization({
   headChannels,
   showCutoff
 }: TimelineVisualizationProps) {
-  if (headChannels.length === 0) {
+  const safeHeadChannels = headChannels ?? [];
+  if (safeHeadChannels.length === 0) {
     return <div className="text-center text-muted-foreground py-12 text-sm">
         Add a Head Channel to view visualization
       </div>;
   }
   return <div className="space-y-6">
-      {headChannels.map(head => {
+      {safeHeadChannels.map(head => {
+      const subChannels = head.subChannels ?? [];
       const headStartMins = timeToMinutes(head.startTime);
       const headEndMins = timeToMinutes(head.endTime);
       const totalDurationMins = headEndMins - headStartMins;
       if (totalDurationMins <= 0) return null;
 
       // Calculate total cutoff time from cutoff sub-channels
-      const cutoffSubs = head.subChannels.filter(s => s.isCutoff);
+      const cutoffSubs = subChannels.filter(s => s.isCutoff);
       const totalCutoffMins = cutoffSubs.reduce((acc, sub) => {
-        return acc + sub.intervals.reduce((intAcc, int) => {
+        const intervals = sub.intervals ?? [];
+        return acc + intervals.reduce((intAcc, int) => {
           return intAcc + getDurationMinutes(int.startTime, int.endTime);
         }, 0);
       }, 0);
@@ -216,6 +227,7 @@ function TimelineVisualization({
 
       // Display duration depends on showCutoff: full if shown, net if hidden
       const displayDurationMins = showCutoff ? totalDurationMins : netOperationalMins;
+      if (displayDurationMins <= 0) return null;
 
       // Generate time markers - always use 30 minute intervals with minutes as label
       const timeMarkers: {
@@ -236,7 +248,7 @@ function TimelineVisualization({
           label: Math.round(displayDurationMins).toString()
         });
       }
-      return <div key={head.id} className="bg-gradient-to-b from-card to-card/80 rounded-xl p-2 shadow-lg border border-border/50 backdrop-blur-sm">
+      return <FullscreenChart key={head.id} title={`${head.name} Timeline`}><div className="bg-gradient-to-b from-card to-card/80 rounded-xl p-2 shadow-lg border border-border/50 backdrop-blur-sm">
             {/* Compact Single-line Header */}
             <div className="flex items-center justify-between mb-0.5">
               <h3 className="text-xs font-semibold text-foreground tracking-tight">
@@ -286,7 +298,7 @@ function TimelineVisualization({
                       <div className="absolute inset-0 bg-gradient-to-r from-primary/30 to-primary/20" />
                       
                       {/* Cutoff overlays */}
-                      {showCutoff && cutoffSubs.map(sub => sub.intervals.map(interval => {
+                      {showCutoff && cutoffSubs.map(sub => (sub.intervals ?? []).map(interval => {
                     const intStart = timeToMinutes(interval.startTime);
                     const intEnd = timeToMinutes(interval.endTime);
                     const left = (intStart - headStartMins) / totalDurationMins * 100;
@@ -305,15 +317,19 @@ function TimelineVisualization({
                 </div>
 
                 {/* Sub channel bars - Lean style with tooltips */}
-                {head.subChannels.filter(s => !s.isCutoff).map(sub => {
-              const cutoffIntervals: CutoffInterval[] = cutoffSubs.flatMap(cs => cs.intervals.map(int => ({
-                startMins: timeToMinutes(int.startTime),
-                endMins: timeToMinutes(int.endTime)
-              })));
-              const slicedActiveMins = calculateSlicedDuration(sub.intervals, cutoffIntervals);
-              const slicedSegments = getSlicedSegments(sub.intervals, cutoffIntervals, headStartMins, totalDurationMins);
-              const firstInt = sub.intervals[0];
-              const lastInt = sub.intervals[sub.intervals.length - 1];
+                {subChannels.filter(s => !s.isCutoff).map(sub => {
+              const intervals = sub.intervals ?? [];
+              if (intervals.length === 0) return null;
+              const cutoffIntervals: CutoffInterval[] = cutoffSubs.flatMap(cs =>
+                (cs.intervals ?? []).map(int => ({
+                  startMins: timeToMinutes(int.startTime),
+                  endMins: timeToMinutes(int.endTime)
+                }))
+              );
+              const slicedActiveMins = calculateSlicedDuration(intervals, cutoffIntervals);
+              const slicedSegments = getSlicedSegments(intervals, cutoffIntervals, headStartMins, totalDurationMins);
+              const firstInt = intervals[0];
+              const lastInt = intervals[intervals.length - 1];
               return <div key={sub.id} className="flex items-center gap-1">
                       <div className="w-10 text-right pr-1 flex-shrink-0 flex items-center justify-end gap-0.5">
                         <div className="w-1.5 h-1.5 rounded-full flex-shrink-0 bg-emerald-500" />
@@ -360,11 +376,13 @@ function TimelineVisualization({
 
                 {/* Cutoff sub channels - Lean with tooltips */}
                 {showCutoff && cutoffSubs.map(sub => {
-              const totalCutMins = sub.intervals.reduce((acc, int) => {
+              const intervals = sub.intervals ?? [];
+              if (intervals.length === 0) return null;
+              const totalCutMins = intervals.reduce((acc, int) => {
                 return acc + getDurationMinutes(int.startTime, int.endTime);
               }, 0);
-              const firstCut = sub.intervals[0];
-              const lastCut = sub.intervals[sub.intervals.length - 1];
+              const firstCut = intervals[0];
+              const lastCut = intervals[intervals.length - 1];
               return <div key={sub.id} className="flex items-center gap-1">
                       <div className="w-10 text-right pr-1 flex items-center justify-end gap-0.5 flex-shrink-0">
                         <Scissors className="w-2 h-2 text-rose-400" />
@@ -378,7 +396,7 @@ function TimelineVisualization({
                         </>
                       } flex={false}>
                         <div className="flex-1 h-5 relative cursor-pointer">
-                          {sub.intervals.map(interval => {
+                          {intervals.map(interval => {
                             const intStart = timeToMinutes(interval.startTime);
                             const intEnd = timeToMinutes(interval.endTime);
                             const left = (intStart - headStartMins) / totalDurationMins * 100;
@@ -429,7 +447,7 @@ function TimelineVisualization({
                   </div>}
               </div>
             </div>
-          </div>;
+          </div></FullscreenChart>;
     })}
     </div>;
 }
@@ -962,7 +980,18 @@ export function ImportTimelineOClock({
   // Calculate head summary with cutoff consideration
   const getHeadSummary = (head: ImportHeadChannel) => {
     const totalMins = getDurationMinutes(head.startTime, head.endTime);
-    const cutoffMins = head.subChannels.filter(s => s.isCutoff).reduce((acc, s) => acc + s.intervals.reduce((intAcc, int) => intAcc + getDurationMinutes(int.startTime, int.endTime), 0), 0);
+    const subChannels = head.subChannels ?? [];
+    const cutoffMins = subChannels
+      .filter(s => s.isCutoff)
+      .reduce(
+        (acc, s) =>
+          acc +
+          (s.intervals ?? []).reduce(
+            (intAcc, int) => intAcc + getDurationMinutes(int.startTime, int.endTime),
+            0
+          ),
+        0
+      );
     return {
       totalMins,
       cutoffMins,
@@ -970,8 +999,8 @@ export function ImportTimelineOClock({
     };
   };
 
-  // Save to compact JSON and copy to clipboard
-  const saveToJson = () => {
+  // Save to compact JSON (TXT file)
+  const saveToJson = async () => {
     if (headChannels.length === 0) {
       toast.error('No data to save');
       return;
@@ -988,16 +1017,34 @@ export function ImportTimelineOClock({
       }))
     }));
     const jsonStr = JSON.stringify(data);
-    navigator.clipboard.writeText(jsonStr).then(() => {
-      toast.success('Data copied to clipboard!');
-    }).catch(() => {
-      toast.error('Failed to copy to clipboard');
-    });
+    const result = await saveTextFile(jsonStr, 'timeline-oclock.txt');
+    if (result.ok) {
+      toast.success('File saved');
+    } else if (result.reason === 'unsupported') {
+      toast.error('File save is not supported in this environment');
+    } else if (result.reason === 'error') {
+      toast.error('Failed to save file');
+      console.error(result.error);
+    }
   };
 
   // Import from JSON
-  const importFromJson = () => {
-    const input = prompt('Paste previously saved JSON data:');
+  const importFromJson = async () => {
+    const fileResult = await openTextFile();
+    let input: string | null = null;
+
+    if (fileResult.ok) {
+      input = fileResult.text;
+    } else if (fileResult.reason === 'unsupported') {
+      input = prompt('Paste previously saved JSON data:');
+    } else if (fileResult.reason === 'error') {
+      toast.error('Failed to open file');
+      console.error(fileResult.error);
+      return;
+    } else {
+      return;
+    }
+
     if (!input) return;
 
     const cleaned = input
@@ -1057,12 +1104,12 @@ export function ImportTimelineOClock({
           
           <button onClick={saveToJson} disabled={!hasData} className="flex items-center gap-1.5 px-3 py-1.5 bg-sky-500 text-white rounded-lg text-xs font-medium hover:bg-sky-600 transition-colors disabled:opacity-50 disabled:cursor-not-allowed">
             <Save className="w-3.5 h-3.5" />
-            Save JSON
+            Save TXT
           </button>
           
           <button onClick={importFromJson} className="flex items-center gap-1.5 px-3 py-1.5 bg-amber-500 text-white rounded-lg text-xs font-medium hover:bg-amber-600 transition-colors">
             <Upload className="w-3.5 h-3.5" />
-            Import JSON
+            Import TXT
           </button>
         </div>
 
@@ -1309,7 +1356,9 @@ export function ImportTimelineOClock({
             </button>
           </div>
           <div ref={visualizationRef}>
-            <TimelineVisualization headChannels={headChannels} showCutoff={showCutoffVisual} />
+            <VisualizationErrorBoundary title="Timeline visualization failed">
+              <TimelineVisualization headChannels={headChannels} showCutoff={showCutoffVisual} />
+            </VisualizationErrorBoundary>
           </div>
         </div>}
 

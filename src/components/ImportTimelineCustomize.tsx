@@ -2,6 +2,9 @@ import { useState, useRef } from 'react';
 import { X, Plus, Trash2, Eye, EyeOff, ChevronDown, ChevronRight, Scissors, FileText, Clock, Save, Upload, Copy, Check, Tag, Settings2 } from 'lucide-react';
 import { toast } from 'sonner';
 import { CursorTooltip } from '@/components/CursorTooltip';
+import { saveTextFile, openTextFile } from '@/lib/textFile';
+import { FullscreenChart } from '@/components/FullscreenChart';
+import { VisualizationErrorBoundary } from '@/components/VisualizationErrorBoundary';
 
 // Color presets for customization
 const COLOR_PRESETS = [
@@ -70,8 +73,13 @@ function generateId(): string {
 }
 
 // Convert "HH:MM" to minutes from midnight
-function timeToMinutes(time: string): number {
-  const [hours, minutes] = time.split(':').map(Number);
+function timeToMinutes(time?: string | number | null): number {
+  if (typeof time === 'number') return Number.isFinite(time) ? time : 0;
+  if (!time || typeof time !== 'string' || !time.includes(':')) return 0;
+  const [hoursRaw, minutesRaw] = time.split(':');
+  const hours = Number(hoursRaw);
+  const minutes = Number(minutesRaw);
+  if (!Number.isFinite(hours) || !Number.isFinite(minutes)) return 0;
   return hours * 60 + minutes;
 }
 
@@ -275,7 +283,8 @@ interface TimelineVisualizationProps {
 function TimelineVisualization({ headChannels, showCutoff, customLabels, mode, visibleStatusLabels, visualSettings, onOpenSettings }: TimelineVisualizationProps) {
   const vs = visualSettings;
   
-  if (headChannels.length === 0) {
+  const safeHeadChannels = headChannels ?? [];
+  if (safeHeadChannels.length === 0) {
     return (
       <div className="text-center text-muted-foreground py-4 text-xs">
         Add a Head Channel to view visualization
@@ -285,7 +294,8 @@ function TimelineVisualization({ headChannels, showCutoff, customLabels, mode, v
 
   return (
     <div className="space-y-3" style={{ padding: vs.containerPadding }}>
-      {headChannels.map((head) => {
+      {safeHeadChannels.map((head) => {
+        const subChannels = head.subChannels ?? [];
         // Calculate total duration based on mode
         let headDurationMins: number;
         let offsetMins = 0;
@@ -303,8 +313,9 @@ function TimelineVisualization({ headChannels, showCutoff, customLabels, mode, v
 
         // Find max end time from all sub-channels (relative to offset)
         let maxSubEndMins = 0;
-        head.subChannels.forEach(sub => {
-          sub.intervals.forEach(interval => {
+        subChannels.forEach(sub => {
+          const intervals = sub.intervals ?? [];
+          intervals.forEach(interval => {
             const relativeEnd = mode === 'oclock' ? interval.endMin - offsetMins : interval.endMin;
             maxSubEndMins = Math.max(maxSubEndMins, relativeEnd);
           });
@@ -313,14 +324,17 @@ function TimelineVisualization({ headChannels, showCutoff, customLabels, mode, v
         // Use the maximum of head duration and max sub end time for graph scale
         const totalDurationMins = Math.max(headDurationMins, maxSubEndMins);
 
-        const cutoffSubs = head.subChannels.filter(s => s.isCutoff);
-        const totalCutoffMins = cutoffSubs.reduce((acc, sub) => 
-          acc + sub.intervals.reduce((a, int) => a + getDurationMinutes(int.startMin, int.endMin), 0), 0);
+        const cutoffSubs = subChannels.filter(s => s.isCutoff);
+        const totalCutoffMins = cutoffSubs.reduce((acc, sub) => {
+          const intervals = sub.intervals ?? [];
+          return acc + intervals.reduce((a, int) => a + getDurationMinutes(int.startMin, int.endMin), 0);
+        }, 0);
         // Net operational is based on head duration, not max duration
         const netOperationalMins = headDurationMins - totalCutoffMins;
 
         // Display duration depends on showCutoff: full if shown, net if hidden
         const displayDurationMins = showCutoff ? totalDurationMins : Math.max(netOperationalMins, maxSubEndMins - totalCutoffMins);
+        if (displayDurationMins <= 0) return null;
 
         // Generate time markers - always use 30 minute intervals with minutes as label
         const timeMarkers: { mins: number; label: string }[] = [];
@@ -335,15 +349,15 @@ function TimelineVisualization({ headChannels, showCutoff, customLabels, mode, v
         }
 
         return (
-          <div 
-            key={head.id} 
-            className="bg-gradient-to-b from-card to-card/80 rounded-xl border border-border/50 backdrop-blur-sm"
-            style={{ 
-              padding: vs.containerPadding,
-              borderRadius: vs.borderRadius,
-              boxShadow: vs.showShadow ? '0 4px 6px -1px rgba(0, 0, 0, 0.1)' : 'none'
-            }}
-          >
+          <FullscreenChart key={head.id} title={`${head.name} Timeline`}>
+            <div 
+              className="bg-gradient-to-b from-card to-card/80 rounded-xl border border-border/50 backdrop-blur-sm"
+              style={{ 
+                padding: vs.containerPadding,
+                borderRadius: vs.borderRadius,
+                boxShadow: vs.showShadow ? '0 4px 6px -1px rgba(0, 0, 0, 0.1)' : 'none'
+              }}
+            >
             {/* Compact Single-line Header */}
             <div className="flex items-center justify-between mb-0.5">
               <div className="flex items-center gap-2">
@@ -461,7 +475,7 @@ function TimelineVisualization({ headChannels, showCutoff, customLabels, mode, v
                         style={{ background: `linear-gradient(to right, ${head.color}4d, ${head.color}33)` }}
                       />
                       {/* Cutoff overlays */}
-                      {showCutoff && cutoffSubs.map(sub => sub.intervals.map(interval => {
+                      {showCutoff && cutoffSubs.map(sub => (sub.intervals ?? []).map(interval => {
                         const left = ((interval.startMin - offsetMins) / headDurationMins) * 100;
                         const width = ((interval.endMin - interval.startMin) / headDurationMins) * 100;
                         return (
@@ -484,23 +498,25 @@ function TimelineVisualization({ headChannels, showCutoff, customLabels, mode, v
                 </div>
 
                 {/* Sub channel bars - Always show all graphs */}
-                {head.subChannels.filter(s => !s.isCutoff).map(sub => {
+                {subChannels.filter(s => !s.isCutoff).map(sub => {
+                  const intervals = sub.intervals ?? [];
+                  if (intervals.length === 0) return null;
                   const cutoffIntervals: CutoffInterval[] = cutoffSubs.flatMap(cs =>
-                    cs.intervals.map(int => ({ startMins: int.startMin, endMins: int.endMin }))
+                    (cs.intervals ?? []).map(int => ({ startMins: int.startMin, endMins: int.endMin }))
                   );
-                  const slicedActiveMins = calculateSlicedDuration(sub.intervals, cutoffIntervals);
+                  const slicedActiveMins = calculateSlicedDuration(intervals, cutoffIntervals);
                   const slicedSegments = getSlicedSegments(
-                    sub.intervals, 
+                    intervals, 
                     cutoffIntervals, 
                     totalDurationMins,
                     offsetMins
                   );
-                  const firstInt = sub.intervals[0];
-                  const lastInt = sub.intervals[sub.intervals.length - 1];
+                  const firstInt = intervals[0];
+                  const lastInt = intervals[intervals.length - 1];
                   const showStatus = visibleStatusLabels.has(sub.id);
 
                   // Get the first interval's color for the label indicator
-                  const labelIndicatorColor = sub.intervals[0]?.color || sub.color;
+                  const labelIndicatorColor = intervals[0]?.color || sub.color;
                   
                   return (
                     <div key={sub.id} className="flex items-center gap-1">
@@ -682,8 +698,8 @@ function TimelineVisualization({ headChannels, showCutoff, customLabels, mode, v
                     />
                     <span style={{ fontSize: vs.valueFontSize - 1 }} className="text-muted-foreground">Total</span>
                   </div>
-                  {head.subChannels.filter(s => !s.isCutoff && visibleStatusLabels.has(s.id)).map(sub => {
-                    const legendColor = sub.intervals[0]?.color || sub.color;
+                  {subChannels.filter(s => !s.isCutoff && visibleStatusLabels.has(s.id)).map(sub => {
+                    const legendColor = (sub.intervals ?? [])[0]?.color || sub.color;
                     return (
                       <div key={sub.id} className="flex items-center gap-1">
                         <div 
@@ -706,7 +722,8 @@ function TimelineVisualization({ headChannels, showCutoff, customLabels, mode, v
                 </div>
               )}
             </div>
-          </div>
+            </div>
+          </FullscreenChart>
         );
       })}
     </div>
@@ -1265,8 +1282,8 @@ export function ImportTimelineCustomize({ onClose }: ImportTimelineCustomizeProp
     return { totalMins, cutoffMins, netMins: totalMins - cutoffMins };
   };
 
-  // Save to compact JSON
-  const saveToJson = () => {
+  // Save to compact JSON (TXT file)
+  const saveToJson = async () => {
     if (headChannels.length === 0) {
       toast.error('No data to save');
       return;
@@ -1294,16 +1311,35 @@ export function ImportTimelineCustomize({ onClose }: ImportTimelineCustomizeProp
       }))
     };
     const jsonStr = JSON.stringify(data);
-    navigator.clipboard.writeText(jsonStr).then(() => {
-      toast.success('Data copied to clipboard!');
-    }).catch(() => {
-      toast.error('Failed to copy to clipboard');
-    });
+    const result = await saveTextFile(jsonStr, 'timeline-customize.txt');
+    if (result.ok) {
+      toast.success('File saved');
+    } else if (result.reason === 'unsupported') {
+      toast.error('File save is not supported in this environment');
+    } else if (result.reason === 'error') {
+      toast.error('Failed to save file');
+      console.error(result.error);
+    }
   };
 
+
   // Import from JSON
-  const importFromJson = () => {
-    const input = prompt('Paste previously saved JSON data:');
+  const importFromJson = async () => {
+    const fileResult = await openTextFile();
+    let input: string | null = null;
+
+    if (fileResult.ok) {
+      input = fileResult.text;
+    } else if (fileResult.reason === 'unsupported') {
+      input = prompt('Paste previously saved JSON data:');
+    } else if (fileResult.reason === 'error') {
+      toast.error('Failed to open file');
+      console.error(fileResult.error);
+      return;
+    } else {
+      return;
+    }
+
     if (!input) return;
 
     const stripCodeFences = (s: string) =>
@@ -1439,7 +1475,7 @@ export function ImportTimelineCustomize({ onClose }: ImportTimelineCustomizeProp
             className="flex items-center gap-1.5 px-3 py-1.5 bg-sky-500 text-white rounded-lg text-xs font-medium hover:bg-sky-600 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
           >
             <Save className="w-3.5 h-3.5" />
-            Save JSON
+            Save TXT
           </button>
 
           <button
@@ -1447,7 +1483,7 @@ export function ImportTimelineCustomize({ onClose }: ImportTimelineCustomizeProp
             className="flex items-center gap-1.5 px-3 py-1.5 bg-amber-500 text-white rounded-lg text-xs font-medium hover:bg-amber-600 transition-colors"
           >
             <Upload className="w-3.5 h-3.5" />
-            Import JSON
+            Import TXT
           </button>
 
           <button
@@ -1981,7 +2017,7 @@ export function ImportTimelineCustomize({ onClose }: ImportTimelineCustomizeProp
           </div>
           <div className="flex flex-wrap gap-2">
             {headChannels.flatMap(head => 
-              head.subChannels.map(sub => (
+              (head.subChannels ?? []).map(sub => (
                 <button
                   key={sub.id}
                   onClick={() => toggleStatusLabelVisibility(sub.id)}
@@ -2046,15 +2082,17 @@ export function ImportTimelineCustomize({ onClose }: ImportTimelineCustomizeProp
             </div>
           </div>
 
-          <TimelineVisualization 
-            headChannels={headChannels} 
-            showCutoff={showCutoffVisual} 
-            customLabels={customLabels}
-            mode={mode}
-            visibleStatusLabels={visibleStatusLabels}
-            visualSettings={visualSettings}
-            onOpenSettings={() => setShowVisualSettings(true)}
-          />
+          <VisualizationErrorBoundary title="Timeline visualization failed">
+            <TimelineVisualization 
+              headChannels={headChannels} 
+              showCutoff={showCutoffVisual} 
+              customLabels={customLabels}
+              mode={mode}
+              visibleStatusLabels={visibleStatusLabels}
+              visualSettings={visualSettings}
+              onOpenSettings={() => setShowVisualSettings(true)}
+            />
+          </VisualizationErrorBoundary>
         </div>
       )}
 

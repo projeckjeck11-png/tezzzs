@@ -11,6 +11,7 @@ import {
 } from "@/components/ui/dialog";
 import { Button } from "@/components/ui/button";
 import { CursorTooltip } from "@/components/CursorTooltip";
+import { FullscreenChart } from "@/components/FullscreenChart";
 import { z } from "zod";
 
 type TargetBasis = "shift" | "cycle" | "hour";
@@ -666,24 +667,26 @@ export function ProductionKpiPanel({
           <div className="text-[10px] font-medium text-muted-foreground mb-2">Perbandingan Output</div>
           
           {/* Chart */}
-          <div className="h-[140px]">
-            <ResponsiveContainer width="100%" height="100%">
-              <BarChart data={chartData} margin={{ top: 4, right: 8, bottom: 4, left: 0 }}>
-                <CartesianGrid stroke="hsl(var(--border))" strokeDasharray="3 3" opacity={0.35} />
-                <XAxis dataKey="name" stroke="hsl(var(--muted-foreground))" fontSize={10} />
-                <YAxis stroke="hsl(var(--muted-foreground))" fontSize={10} />
-                <Tooltip
-                  contentStyle={{
-                    backgroundColor: "hsl(var(--card))",
-                    border: "1px solid hsl(var(--border))",
-                    borderRadius: 10,
-                  }}
-                  formatter={(v: any) => [`${Number(v).toFixed(2)} unit`, ""]}
-                />
-                <Bar dataKey="value" fill="hsl(var(--primary))" radius={[6, 6, 0, 0]} />
-              </BarChart>
-            </ResponsiveContainer>
-          </div>
+            <FullscreenChart title="KPI Output Chart" fillWidth={false} contentClassName="max-w-lg w-full">
+            <div className="h-[140px]">
+              <ResponsiveContainer width="100%" height="100%">
+                <BarChart data={chartData} margin={{ top: 4, right: 8, bottom: 4, left: 0 }}>
+                  <CartesianGrid stroke="hsl(var(--border))" strokeDasharray="3 3" opacity={0.35} />
+                  <XAxis dataKey="name" stroke="hsl(var(--muted-foreground))" fontSize={10} />
+                  <YAxis stroke="hsl(var(--muted-foreground))" fontSize={10} />
+                  <Tooltip
+                    contentStyle={{
+                      backgroundColor: "hsl(var(--card))",
+                      border: "1px solid hsl(var(--border))",
+                      borderRadius: 10,
+                    }}
+                    formatter={(v: any) => [`${Number(v).toFixed(2)} unit`, ""]}
+                  />
+                  <Bar dataKey="value" fill="hsl(var(--primary))" radius={[6, 6, 0, 0]} />
+                </BarChart>
+              </ResponsiveContainer>
+            </div>
+          </FullscreenChart>
 
           {/* Key Metrics under chart */}
           <div className="grid grid-cols-2 gap-2 mt-3 text-xs">
