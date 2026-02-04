@@ -1358,16 +1358,39 @@ export function ImportTimelineCustomize({ onClose }: ImportTimelineCustomizeProp
       let parsed: any = JSON.parse(payload);
       if (typeof parsed === 'string') parsed = JSON.parse(parsed);
 
-      if (parsed.mode) setMode(parsed.mode);
+      const hadExistingHeads = headChannels.length > 0;
+      const hasExistingData = hadExistingHeads || customLabels.length > 0;
+
+      if (parsed.mode) {
+        if (!mode || !hasExistingData) {
+          setMode(parsed.mode);
+        } else if (parsed.mode !== mode) {
+          toast.warning(`Imported data uses "${parsed.mode}" mode. Keeping current "${mode}" mode.`);
+        }
+      }
+
       if (parsed.labels) {
-        setCustomLabels(
-          (parsed.labels as any[]).map((l: any) => ({
-            id: l.id || generateId(),
-            key: l.key ?? 'Label',
-            value: l.value ?? '',
-            color: l.color || COLOR_PRESETS[0]?.value || '#8b5cf6',
-          }))
-        );
+        const incomingLabels = (parsed.labels as any[]).map((l: any) => ({
+          id: l.id || generateId(),
+          key: l.key ?? 'Label',
+          value: l.value ?? '',
+          color: l.color || COLOR_PRESETS[0]?.value || '#8b5cf6',
+        }));
+
+        if (incomingLabels.length > 0) {
+          setCustomLabels(prev => {
+            const used = new Set(prev.map(label => label.id));
+            const merged = incomingLabels.map(label => {
+              let nextId = label.id;
+              if (used.has(nextId)) {
+                nextId = generateId();
+              }
+              used.add(nextId);
+              return { ...label, id: nextId };
+            });
+            return [...prev, ...merged];
+          });
+        }
       }
 
       const imported: ImportHeadChannel[] = (parsed.heads || []).map((h: any) => ({
@@ -1404,8 +1427,8 @@ export function ImportTimelineCustomize({ onClose }: ImportTimelineCustomizeProp
         })
       }));
 
-      setHeadChannels(imported);
-      toast.success(`Successfully imported ${imported.length} head channel(s)!`);
+      setHeadChannels(prev => [...prev, ...imported]);
+      toast.success(`Successfully imported ${imported.length} head channel(s)${hadExistingHeads ? ' (merged)' : ''}!`);
     } catch {
       toast.error('Invalid JSON format');
     }
