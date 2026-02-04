@@ -1,5 +1,5 @@
-import { useState, useRef } from 'react';
-import { X, Plus, Trash2, Eye, EyeOff, ChevronDown, ChevronRight, Scissors, FileText, Clock, Save, Upload, Copy, Check, Tag, Settings2 } from 'lucide-react';
+import { useState, useRef, useEffect, type PointerEvent } from 'react';
+import { X, Plus, Trash2, Eye, EyeOff, ChevronDown, ChevronRight, Scissors, FileText, Clock, Save, Upload, Copy, Check, Tag, Settings2, GripVertical } from 'lucide-react';
 import { toast } from 'sonner';
 import { CursorTooltip } from '@/components/CursorTooltip';
 import { saveTextFile, openTextFile } from '@/lib/textFile';
@@ -88,6 +88,27 @@ function minutesToTime(mins: number): string {
   const hours = Math.floor(mins / 60) % 24;
   const minutes = mins % 60;
   return `${hours.toString().padStart(2, '0')}:${minutes.toString().padStart(2, '0')}`;
+}
+
+function getSubShiftBounds(head: ImportHeadChannel, sub: ImportSubChannel, mode: InputMode) {
+  const intervals = sub.intervals ?? [];
+  if (intervals.length === 0) return { min: 0, max: 0 };
+  const minStart = Math.min(...intervals.map(interval => interval.startMin));
+  const maxEnd = Math.max(...intervals.map(interval => interval.endMin));
+
+  if (mode === 'oclock') {
+    const headStart = timeToMinutes(head.startTime);
+    const headEnd = timeToMinutes(head.endTime);
+    return {
+      min: headStart - minStart,
+      max: headEnd - maxEnd
+    };
+  }
+
+  return {
+    min: 0 - minStart,
+    max: head.totalMinutes - maxEnd
+  };
 }
 
 // Format duration in minutes to readable string based on time unit
@@ -277,12 +298,244 @@ interface TimelineVisualizationProps {
   mode: InputMode;
   visibleStatusLabels: Set<string>;
   visualSettings: VisualSettings;
+  reorderEnabled: boolean;
+  shiftTimeEnabled: boolean;
+  onMoveSubChannel?: (fromHeadId: string, subId: string, toHeadId: string, toIndex: number | null) => void;
+  onShiftSubChannel?: (headId: string, subId: string, deltaMins: number) => void;
+  onShiftSessionStart?: () => void;
+  onShiftSessionEnd?: () => void;
   onOpenSettings?: () => void;
 }
 
-function TimelineVisualization({ headChannels, showCutoff, customLabels, mode, visibleStatusLabels, visualSettings, onOpenSettings }: TimelineVisualizationProps) {
+function TimelineVisualization({ headChannels, showCutoff, customLabels, mode, visibleStatusLabels, visualSettings, reorderEnabled, shiftTimeEnabled, onMoveSubChannel, onShiftSubChannel, onShiftSessionStart, onShiftSessionEnd, onOpenSettings }: TimelineVisualizationProps) {
   const vs = visualSettings;
-  
+  const canReorder = reorderEnabled && typeof onMoveSubChannel === 'function';
+  const canShiftTime = shiftTimeEnabled && typeof onShiftSubChannel === 'function';
+  const [draggingSub, setDraggingSub] = useState<{ headId: string; subId: string } | null>(null);
+  const [shiftingSub, setShiftingSub] = useState<{ headId: string; subId: string } | null>(null);
+  const [selectedSub, setSelectedSub] = useState<{ headId: string; subId: string } | null>(null);
+  const [dragOverTarget, setDragOverTarget] = useState<{ headId: string; index: number | null } | null>(null);
+  const dragStateRef = useRef<{ pointerId: number; headId: string; subId: string } | null>(null);
+  const timeShiftRef = useRef<{
+    pointerId: number;
+    headId: string;
+    subId: string;
+    startX: number;
+    lastApplied: number;
+    durationMins: number;
+    trackWidth: number;
+    minDelta: number;
+    maxDelta: number;
+  } | null>(null);
+  const windowHandlersRef = useRef<{
+    move: (event: globalThis.PointerEvent) => void;
+    up: (event: globalThis.PointerEvent) => void;
+    cancel: (event: globalThis.PointerEvent) => void;
+  } | null>(null);
+
+  useEffect(() => {
+    if (!canShiftTime || !selectedSub) return;
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key !== 'ArrowLeft' && event.key !== 'ArrowRight') return;
+      const target = event.target as HTMLElement | null;
+      if (target?.isContentEditable) return;
+      const tag = target?.tagName?.toLowerCase();
+      if (tag === 'input' || tag === 'textarea' || tag === 'select') return;
+
+      const head = headChannels.find(h => h.id === selectedSub.headId);
+      const sub = head?.subChannels?.find(s => s.id === selectedSub.subId);
+      if (!head || !sub) return;
+
+      event.preventDefault();
+      const step = event.shiftKey ? 5 : 1;
+      const delta = event.key === 'ArrowLeft' ? -step : step;
+      const bounds = getSubShiftBounds(head, sub, mode);
+      const clamped = Math.min(bounds.max, Math.max(bounds.min, delta));
+      if (clamped === 0) return;
+      onShiftSubChannel?.(head.id, sub.id, clamped);
+    };
+
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, [canShiftTime, selectedSub, headChannels, mode, onShiftSubChannel]);
+
+  useEffect(() => {
+    if (canShiftTime) return;
+    setSelectedSub(null);
+    setShiftingSub(null);
+    timeShiftRef.current = null;
+    removeWindowListeners();
+  }, [canShiftTime]);
+
+  const updateDragOverTarget = (next: { headId: string; index: number | null } | null) => {
+    setDragOverTarget(prev => {
+      if (!prev && !next) return prev;
+      if (prev && next && prev.headId === next.headId && prev.index === next.index) return prev;
+      return next;
+    });
+  };
+
+  const resolveDropTarget = (clientX: number, clientY: number) => {
+    if (typeof document === 'undefined') return null;
+    const element = document.elementFromPoint(clientX, clientY) as HTMLElement | null;
+    if (!element) return null;
+    const target = element.closest('[data-drop-kind]') as HTMLElement | null;
+    if (!target) return null;
+    const headId = target.getAttribute('data-drop-head-id');
+    if (!headId) return null;
+    const kind = target.getAttribute('data-drop-kind');
+    if (kind === 'head') return { headId, index: null };
+    const indexRaw = target.getAttribute('data-drop-index');
+    const index = indexRaw != null ? Number(indexRaw) : NaN;
+    if (Number.isFinite(index)) return { headId, index };
+    return null;
+  };
+
+  const handleGlobalPointerMove = (event: PointerEvent) => {
+    handlePointerMove(event);
+    handleTimeShiftMove(event);
+  };
+
+  const handleGlobalPointerUp = (event: PointerEvent) => {
+    finalizePointerDrag(event);
+    finalizeTimeShift(event);
+  };
+
+  const addWindowListeners = () => {
+    if (typeof window === 'undefined' || windowHandlersRef.current) return;
+    const move = (event: globalThis.PointerEvent) => handleGlobalPointerMove(event as unknown as PointerEvent);
+    const up = (event: globalThis.PointerEvent) => handleGlobalPointerUp(event as unknown as PointerEvent);
+    const cancel = (event: globalThis.PointerEvent) => handleGlobalPointerUp(event as unknown as PointerEvent);
+    window.addEventListener('pointermove', move);
+    window.addEventListener('pointerup', up);
+    window.addEventListener('pointercancel', cancel);
+    windowHandlersRef.current = { move, up, cancel };
+  };
+
+  const removeWindowListeners = () => {
+    if (typeof window === 'undefined') return;
+    if (dragStateRef.current || timeShiftRef.current) return;
+    const handlers = windowHandlersRef.current;
+    if (!handlers) return;
+    window.removeEventListener('pointermove', handlers.move);
+    window.removeEventListener('pointerup', handlers.up);
+    window.removeEventListener('pointercancel', handlers.cancel);
+    windowHandlersRef.current = null;
+  };
+
+  const handlePointerDown = (event: PointerEvent, headId: string, subId: string) => {
+    if (!canReorder) return;
+    event.preventDefault();
+    event.stopPropagation();
+    dragStateRef.current = { pointerId: event.pointerId, headId, subId };
+    setDraggingSub({ headId, subId });
+    addWindowListeners();
+    const target = event.currentTarget as HTMLElement | null;
+    if (target?.setPointerCapture) {
+      try {
+        target.setPointerCapture(event.pointerId);
+      } catch {
+        // Ignore pointer capture errors
+      }
+    }
+  };
+
+  const handlePointerMove = (event: PointerEvent) => {
+    const state = dragStateRef.current;
+    if (!state || !canReorder || state.pointerId !== event.pointerId) return;
+    const target = resolveDropTarget(event.clientX, event.clientY);
+    updateDragOverTarget(target);
+  };
+
+  const finalizePointerDrag = (event: PointerEvent) => {
+    const state = dragStateRef.current;
+    if (!state || !canReorder || state.pointerId !== event.pointerId) return;
+    const target = resolveDropTarget(event.clientX, event.clientY);
+    if (target && onMoveSubChannel) {
+      onMoveSubChannel(state.headId, state.subId, target.headId, target.index);
+    }
+    dragStateRef.current = null;
+    setDraggingSub(null);
+    updateDragOverTarget(null);
+    removeWindowListeners();
+    const current = event.currentTarget as HTMLElement | null;
+    if (current?.releasePointerCapture) {
+      try {
+        current.releasePointerCapture(event.pointerId);
+      } catch {
+        // Ignore pointer release errors
+      }
+    }
+  };
+
+  const handleTimeShiftStart = (event: PointerEvent, head: ImportHeadChannel, sub: ImportSubChannel, durationMins: number) => {
+    if (!canShiftTime) return;
+    const intervals = sub.intervals ?? [];
+    if (intervals.length === 0) return;
+    onShiftSessionStart?.();
+    setSelectedSub({ headId: head.id, subId: sub.id });
+    const track = event.currentTarget as HTMLElement | null;
+    const trackWidth = track?.getBoundingClientRect().width ?? 0;
+    if (!Number.isFinite(trackWidth) || trackWidth <= 0) return;
+    const bounds = getSubShiftBounds(head, sub, mode);
+    if (bounds.min > bounds.max) return;
+
+    event.preventDefault();
+    event.stopPropagation();
+    timeShiftRef.current = {
+      pointerId: event.pointerId,
+      headId: head.id,
+      subId: sub.id,
+      startX: event.clientX,
+      lastApplied: 0,
+      durationMins,
+      trackWidth,
+      minDelta: bounds.min,
+      maxDelta: bounds.max
+    };
+    setShiftingSub({ headId: head.id, subId: sub.id });
+    addWindowListeners();
+    if (track?.setPointerCapture) {
+      try {
+        track.setPointerCapture(event.pointerId);
+      } catch {
+        // Ignore pointer capture errors
+      }
+    }
+  };
+
+  const handleTimeShiftMove = (event: PointerEvent) => {
+    const state = timeShiftRef.current;
+    if (!state || !canShiftTime || state.pointerId !== event.pointerId) return;
+    const dx = event.clientX - state.startX;
+    const speedFactor = 1.3;
+    const rawDelta = Math.round((dx / state.trackWidth) * state.durationMins * speedFactor);
+    const desiredDelta = Math.min(state.maxDelta, Math.max(state.minDelta, rawDelta));
+    const step = desiredDelta - state.lastApplied;
+    if (step === 0) return;
+    const applied = onShiftSubChannel?.(state.headId, state.subId, step) ?? 0;
+    if (applied !== 0) {
+      state.lastApplied += applied;
+    }
+  };
+
+  const finalizeTimeShift = (event: PointerEvent) => {
+    const state = timeShiftRef.current;
+    if (!state || !canShiftTime || state.pointerId !== event.pointerId) return;
+    timeShiftRef.current = null;
+    setShiftingSub(null);
+    onShiftSessionEnd?.();
+    removeWindowListeners();
+    const current = event.currentTarget as HTMLElement | null;
+    if (current?.releasePointerCapture) {
+      try {
+        current.releasePointerCapture(event.pointerId);
+      } catch {
+        // Ignore pointer release errors
+      }
+    }
+  };
+    
   const safeHeadChannels = headChannels ?? [];
   if (safeHeadChannels.length === 0) {
     return (
@@ -333,10 +586,11 @@ function TimelineVisualization({ headChannels, showCutoff, customLabels, mode, v
         const netOperationalMins = headDurationMins - totalCutoffMins;
 
         // Display duration depends on showCutoff: full if shown, net if hidden
-        const displayDurationMins = showCutoff ? totalDurationMins : Math.max(netOperationalMins, maxSubEndMins - totalCutoffMins);
-        if (displayDurationMins <= 0) return null;
+          const displayDurationMins = showCutoff ? totalDurationMins : Math.max(netOperationalMins, maxSubEndMins - totalCutoffMins);
+          if (displayDurationMins <= 0) return null;
+          const isHeadDropTarget = dragOverTarget?.headId === head.id && dragOverTarget.index === null;
 
-        // Generate time markers - always use 30 minute intervals with minutes as label
+          // Generate time markers - always use 30 minute intervals with minutes as label
         const timeMarkers: { mins: number; label: string }[] = [];
         const stepMinutes = 30; // Fixed 30 minute intervals
         
@@ -350,14 +604,16 @@ function TimelineVisualization({ headChannels, showCutoff, customLabels, mode, v
 
         return (
           <FullscreenChart key={head.id} title={`${head.name} Timeline`}>
-            <div 
-              className="bg-gradient-to-b from-card to-card/80 rounded-xl border border-border/50 backdrop-blur-sm"
-              style={{ 
-                padding: vs.containerPadding,
-                borderRadius: vs.borderRadius,
-                boxShadow: vs.showShadow ? '0 4px 6px -1px rgba(0, 0, 0, 0.1)' : 'none'
-              }}
-            >
+              <div 
+                className={`bg-gradient-to-b from-card to-card/80 rounded-xl border border-border/50 backdrop-blur-sm ${isHeadDropTarget ? 'ring-2 ring-emerald-400/40' : ''}`}
+                style={{ 
+                  padding: vs.containerPadding,
+                  borderRadius: vs.borderRadius,
+                  boxShadow: vs.showShadow ? '0 4px 6px -1px rgba(0, 0, 0, 0.1)' : 'none'
+                }}
+                data-drop-kind="head"
+                data-drop-head-id={head.id}
+              >
             {/* Compact Single-line Header */}
             <div className="flex items-center justify-between mb-0.5">
               <div className="flex items-center gap-2">
@@ -445,60 +701,67 @@ function TimelineVisualization({ headChannels, showCutoff, customLabels, mode, v
               <div style={{ gap: vs.barGap }} className="flex flex-col">
                 {/* Head channel bar (Total) - Always visible */}
                 <div className="flex items-center gap-1">
-                  <div style={{ width: vs.labelWidth }} className="text-right pr-1 flex-shrink-0">
-                    <span style={{ fontSize: vs.labelFontSize }} className="font-semibold text-muted-foreground uppercase tracking-wider">Total</span>
+                  <div style={{ width: vs.labelWidth }} className="pr-1 flex-shrink-0 overflow-hidden">
+                    <span style={{ fontSize: vs.labelFontSize }} className="font-semibold text-muted-foreground uppercase tracking-wider block truncate text-right">
+                      Total
+                    </span>
                   </div>
-                  <CursorTooltip content={
-                    <>
-                      <p className="font-medium">
-                        {mode === 'oclock' ? `${head.startTime} → ${head.endTime}` : `0 → ${formatDuration(headDurationMins, vs.timeUnit)}`}
-                      </p>
-                      <p className="text-muted-foreground">Net: {formatDurationMixed(netOperationalMins)} ({netOperationalMins} min)</p>
-                      {totalDurationMins > headDurationMins && (
-                        <p className="text-amber-500">Graph scaled to {formatDuration(totalDurationMins, vs.timeUnit)} (sub exceeds head)</p>
-                      )}
-                    </>
-                  }>
-                    <div 
-                      className="rounded relative overflow-hidden border cursor-pointer"
-                      style={{
-                        height: vs.barHeight + 4,
-                        borderRadius: vs.borderRadius,
-                        opacity: vs.barOpacity / 100,
-                        background: `linear-gradient(to right, ${head.color}33, ${head.color}1a)`,
-                        borderColor: `${head.color}33`,
-                        width: `${(headDurationMins / totalDurationMins) * 100}%`
-                      }}
+                  <div className="flex-1 relative" style={{ height: vs.barHeight + 4 }}>
+                    <CursorTooltip
+                      asChild
+                      content={
+                        <>
+                          <p className="font-medium">
+                            {mode === 'oclock' ? `${head.startTime} → ${head.endTime}` : `0 → ${formatDuration(headDurationMins, vs.timeUnit)}`}
+                          </p>
+                          <p className="text-muted-foreground">Net: {formatDurationMixed(netOperationalMins)} ({netOperationalMins} min)</p>
+                          {totalDurationMins > headDurationMins && (
+                            <p className="text-amber-500">Graph scaled to {formatDuration(totalDurationMins, vs.timeUnit)} (sub exceeds head)</p>
+                          )}
+                        </>
+                      }
                     >
                       <div 
-                        className="absolute inset-0" 
-                        style={{ background: `linear-gradient(to right, ${head.color}4d, ${head.color}33)` }}
-                      />
-                      {/* Cutoff overlays */}
-                      {showCutoff && cutoffSubs.map(sub => (sub.intervals ?? []).map(interval => {
-                        const left = ((interval.startMin - offsetMins) / headDurationMins) * 100;
-                        const width = ((interval.endMin - interval.startMin) / headDurationMins) * 100;
-                        return (
-                          <div
-                            key={interval.id}
-                            className="absolute top-0 h-full bg-rose-500/50 backdrop-blur-sm"
-                            style={{
-                              left: `${Math.max(0, Math.min(100, left))}%`,
-                              width: `${Math.max(Math.min(width, 100 - left), 0.5)}%`,
-                              backgroundImage: 'repeating-linear-gradient(135deg, transparent, transparent 4px, rgba(255,255,255,0.1) 4px, rgba(255,255,255,0.1) 8px)'
-                            }}
-                          />
-                        );
-                      }))}
-                    </div>
-                  </CursorTooltip>
+                        className="rounded relative overflow-hidden border cursor-pointer"
+                        style={{
+                          height: vs.barHeight + 4,
+                          borderRadius: vs.borderRadius,
+                          opacity: vs.barOpacity / 100,
+                          background: `linear-gradient(to right, ${head.color}33, ${head.color}1a)`,
+                          borderColor: `${head.color}33`,
+                          width: `${(headDurationMins / totalDurationMins) * 100}%`
+                        }}
+                      >
+                        <div 
+                          className="absolute inset-0" 
+                          style={{ background: `linear-gradient(to right, ${head.color}4d, ${head.color}33)` }}
+                        />
+                        {/* Cutoff overlays */}
+                        {showCutoff && cutoffSubs.map(sub => (sub.intervals ?? []).map(interval => {
+                          const left = ((interval.startMin - offsetMins) / headDurationMins) * 100;
+                          const width = ((interval.endMin - interval.startMin) / headDurationMins) * 100;
+                          return (
+                            <div
+                              key={interval.id}
+                              className="absolute top-0 h-full bg-rose-500/50 backdrop-blur-sm"
+                              style={{
+                                left: `${Math.max(0, Math.min(100, left))}%`,
+                                width: `${Math.max(Math.min(width, 100 - left), 0.5)}%`,
+                                backgroundImage: 'repeating-linear-gradient(135deg, transparent, transparent 4px, rgba(255,255,255,0.1) 4px, rgba(255,255,255,0.1) 8px)'
+                              }}
+                            />
+                          );
+                        }))}
+                      </div>
+                    </CursorTooltip>
+                  </div>
                   <div style={{ width: vs.valueWidth }} className="text-right flex-shrink-0">
                     <span style={{ fontSize: vs.valueFontSize }} className="font-semibold text-foreground tabular-nums">{formatDuration(netOperationalMins, vs.timeUnit)}</span>
                   </div>
                 </div>
 
                 {/* Sub channel bars - Always show all graphs */}
-                {subChannels.filter(s => !s.isCutoff).map(sub => {
+                {subChannels.filter(s => !s.isCutoff).map((sub, subIndex) => {
                   const intervals = sub.intervals ?? [];
                   if (intervals.length === 0) return null;
                   const cutoffIntervals: CutoffInterval[] = cutoffSubs.flatMap(cs =>
@@ -518,14 +781,45 @@ function TimelineVisualization({ headChannels, showCutoff, customLabels, mode, v
                   // Get the first interval's color for the label indicator
                   const labelIndicatorColor = intervals[0]?.color || sub.color;
                   
+                  const isRowDropTarget = dragOverTarget?.headId === head.id && dragOverTarget.index === subIndex;
+                  const isDraggingThis = draggingSub?.subId === sub.id;
+                  const isShiftingThis = shiftingSub?.subId === sub.id;
+                  const isSelectedThis = canShiftTime && selectedSub?.subId === sub.id && selectedSub?.headId === head.id;
+                  const reorderPointerProps = canReorder
+                    ? {
+                        onPointerDown: (event: PointerEvent) => handlePointerDown(event, head.id, sub.id)
+                      }
+                    : {};
                   return (
-                    <div key={sub.id} className="flex items-center gap-1">
-                      <div style={{ width: vs.labelWidth }} className="text-right pr-1 flex-shrink-0 flex items-center justify-end gap-1">
-                        <div 
-                          className="w-1.5 h-1.5 rounded-full flex-shrink-0" 
-                          style={{ backgroundColor: labelIndicatorColor }}
-                        />
-                        <span style={{ fontSize: vs.labelFontSize }} className="text-muted-foreground truncate block">{sub.name}</span>
+                    <div
+                      key={sub.id}
+                      className={`flex items-center gap-1 ${isRowDropTarget ? 'outline outline-1 outline-emerald-400/70 rounded' : ''} ${isDraggingThis ? 'opacity-60' : ''} ${isSelectedThis ? 'ring-1 ring-sky-400/60 rounded' : ''}`}
+                      data-drop-kind="sub"
+                      data-drop-head-id={head.id}
+                      data-drop-index={subIndex}
+                      style={canReorder ? { userSelect: 'none', touchAction: 'none' } : undefined}
+                    >
+                      <div style={{ width: vs.labelWidth }} className="pr-1 flex-shrink-0 overflow-hidden">
+                        <div
+                          className={`flex items-center justify-end gap-1 ${canReorder ? 'cursor-grab active:cursor-grabbing' : ''}`}
+                          style={canReorder ? { userSelect: 'none', touchAction: 'none' } : undefined}
+                          {...reorderPointerProps}
+                        >
+                          {canReorder && (
+                            <GripVertical className="w-3 h-3 text-muted-foreground/70 flex-shrink-0" />
+                          )}
+                          <div 
+                            className="w-1.5 h-1.5 rounded-full flex-shrink-0" 
+                            style={{ backgroundColor: labelIndicatorColor }}
+                          />
+                          <span
+                            style={{ fontSize: vs.labelFontSize }}
+                            className="text-muted-foreground truncate text-right min-w-0 flex-1"
+                            title={sub.name}
+                          >
+                            {sub.name}
+                          </span>
+                        </div>
                       </div>
                       <CursorTooltip
                         asChild
@@ -544,10 +838,14 @@ function TimelineVisualization({ headChannels, showCutoff, customLabels, mode, v
                         }
                       >
                         <div 
-                          className="flex-1 relative cursor-pointer"
+                          className={`flex-1 relative ${canShiftTime ? 'cursor-ew-resize' : 'cursor-pointer'}`}
                           style={{ 
                             height: vs.barHeight, 
                             opacity: vs.barOpacity / 100 
+                          }}
+                          onPointerDown={canShiftTime ? (event) => handleTimeShiftStart(event, head, sub, headDurationMins) : undefined}
+                          onClick={() => {
+                            if (canShiftTime) setSelectedSub({ headId: head.id, subId: sub.id });
                           }}
                         >
                           {slicedSegments.map(segment => {
@@ -586,7 +884,14 @@ function TimelineVisualization({ headChannels, showCutoff, customLabels, mode, v
                           })}
                         </div>
                       </CursorTooltip>
-                      <div style={{ width: vs.valueWidth }} className="text-right flex-shrink-0 flex items-center gap-1">
+                      <div style={{ width: vs.valueWidth }} className="text-right flex-shrink-0 flex items-center gap-1 relative">
+                        {(isShiftingThis || isSelectedThis) && (
+                          <span className="absolute -top-3 right-0 text-[9px] text-sky-500 whitespace-nowrap">
+                            {mode === 'oclock'
+                              ? `${firstInt?.startTime || '-'}-${lastInt?.endTime || '-'}`
+                              : `${Math.round(firstInt?.startMin || 0)}-${Math.round(lastInt?.endMin || 0)}m`}
+                          </span>
+                        )}
                         <span style={{ fontSize: vs.valueFontSize }} className="text-muted-foreground tabular-nums">{formatDuration(slicedActiveMins, vs.timeUnit)}</span>
                         {showStatus && sub.status && (
                           <span style={{ fontSize: vs.valueFontSize - 1 }} className="px-1 py-0.5 rounded bg-primary/10 text-primary">{sub.status}</span>
@@ -739,7 +1044,23 @@ export function ImportTimelineCustomize({ onClose }: ImportTimelineCustomizeProp
   const [summaryText, setSummaryText] = useState('');
   const [copied, setCopied] = useState(false);
   const [customLabels, setCustomLabels] = useState<CustomLabel[]>([]);
+  const [reorderSubEnabled, setReorderSubEnabled] = useState(false);
+  const [shiftTimeEnabled, setShiftTimeEnabled] = useState(false);
   const [visibleStatusLabels, setVisibleStatusLabels] = useState<Set<string>>(new Set());
+  const [undoStack, setUndoStack] = useState<ImportHeadChannel[][]>([]);
+  const [redoStack, setRedoStack] = useState<ImportHeadChannel[][]>([]);
+  const shiftSessionRef = useRef(false);
+  const [colorClipboard, setColorClipboard] = useState<string | null>(null);
+  const [headColorDraft, setHeadColorDraft] = useState<Record<string, string>>({});
+  const [subColorDraft, setSubColorDraft] = useState<Record<string, string>>({});
+  const [intervalColorDraft, setIntervalColorDraft] = useState<Record<string, string>>({});
+  const [headDragOverIndex, setHeadDragOverIndex] = useState<number | null>(null);
+  const headDragRef = useRef<{ pointerId: number; fromIndex: number } | null>(null);
+  const headDragHandlersRef = useRef<{
+    move: (event: globalThis.PointerEvent) => void;
+    up: (event: globalThis.PointerEvent) => void;
+    cancel: (event: globalThis.PointerEvent) => void;
+  } | null>(null);
   const [showVisibilityPanel, setShowVisibilityPanel] = useState(false);
   const [showVisualSettings, setShowVisualSettings] = useState(false);
   const [visualSettings, setVisualSettings] = useState<VisualSettings>(DEFAULT_VISUAL_SETTINGS);
@@ -1044,6 +1365,255 @@ export function ImportTimelineCustomize({ onClose }: ImportTimelineCustomizeProp
     }
   };
 
+  const normalizeColorCode = (value?: string | null) => {
+    const raw = (value || '').trim();
+    if (!raw) return null;
+    const match = raw.match(/^#?([0-9a-f]{3}|[0-9a-f]{6})$/i);
+    if (!match) return null;
+    return `#${match[1].toLowerCase()}`;
+  };
+
+  const handleCopyColorCode = async (value: string) => {
+    const normalized = normalizeColorCode(value);
+    if (!normalized) {
+      toast.error('Invalid color');
+      return;
+    }
+    setColorClipboard(normalized);
+    try {
+      await navigator.clipboard.writeText(normalized);
+    } catch {
+      // Clipboard might be unavailable; keep local clipboard
+    }
+    toast.success(`Color copied ${normalized}`);
+  };
+
+  const handlePasteColorCode = async (apply: (color: string) => void, fallbackValue?: string | null) => {
+    let clipboardText: string | null = null;
+    try {
+      clipboardText = await navigator.clipboard.readText();
+    } catch {
+      // Ignore clipboard read errors
+    }
+    let normalized = normalizeColorCode(clipboardText);
+    if (!normalized && fallbackValue) {
+      normalized = normalizeColorCode(fallbackValue);
+    }
+    if (!normalized && colorClipboard) {
+      normalized = normalizeColorCode(colorClipboard);
+    }
+    if (!normalized) {
+      toast.error('Clipboard color not available');
+      return;
+    }
+    apply(normalized);
+    setColorClipboard(normalized);
+    toast.success(`Color pasted ${normalized}`);
+  };
+
+  const moveSubChannel = (fromHeadId: string, subId: string, toHeadId: string, toIndex: number | null) => {
+    pushUndoSnapshot(headChannels);
+    setHeadChannels(prev => {
+      const next = prev.map(head => ({
+        ...head,
+        subChannels: [...(head.subChannels ?? [])]
+      }));
+
+      const fromHead = next.find(head => head.id === fromHeadId);
+      const toHead = next.find(head => head.id === toHeadId);
+      if (!fromHead || !toHead) return prev;
+
+      const fromNon = fromHead.subChannels.filter(sub => !sub.isCutoff);
+      const fromCut = fromHead.subChannels.filter(sub => sub.isCutoff);
+      const fromIndex = fromNon.findIndex(sub => sub.id === subId);
+      if (fromIndex === -1) return prev;
+
+      const [moving] = fromNon.splice(fromIndex, 1);
+
+      const sameHead = fromHead.id === toHead.id;
+      const toNon = sameHead ? fromNon : toHead.subChannels.filter(sub => !sub.isCutoff);
+      const toCut = sameHead ? fromCut : toHead.subChannels.filter(sub => sub.isCutoff);
+
+      let insertIndex = toIndex == null ? toNon.length : Math.max(0, Math.min(toNon.length, toIndex));
+      if (sameHead && toIndex != null && insertIndex > fromIndex) {
+        insertIndex -= 1;
+      }
+
+      toNon.splice(insertIndex, 0, moving);
+
+      fromHead.subChannels = [...fromNon, ...fromCut];
+      toHead.subChannels = [...toNon, ...toCut];
+
+      return next;
+    });
+  };
+
+  const shiftSubChannelBy = (headId: string, subId: string, deltaMins: number) => {
+    if (deltaMins === 0) return 0;
+    if (!shiftSessionRef.current) {
+      pushUndoSnapshot(headChannels);
+    }
+    let applied = 0;
+    setHeadChannels(prev =>
+      prev.map(head => {
+        if (head.id !== headId) return head;
+        return {
+          ...head,
+          subChannels: (head.subChannels ?? []).map(sub => {
+            if (sub.id !== subId) return sub;
+            applied = deltaMins;
+            return {
+              ...sub,
+              intervals: (sub.intervals ?? []).map(interval => {
+                const startMin = interval.startMin + deltaMins;
+                const endMin = interval.endMin + deltaMins;
+                return {
+                  ...interval,
+                  startMin,
+                  endMin,
+                  startTime: minutesToTime(startMin),
+                  endTime: minutesToTime(endMin)
+                };
+              })
+            };
+          })
+        };
+      })
+    );
+    return applied;
+  };
+
+  const cloneHeads = (heads: ImportHeadChannel[]) => JSON.parse(JSON.stringify(heads)) as ImportHeadChannel[];
+
+  const pushUndoSnapshot = (snapshot: ImportHeadChannel[]) => {
+    const cloned = cloneHeads(snapshot);
+    setUndoStack(prev => [...prev, cloned].slice(-50));
+    setRedoStack([]);
+  };
+
+  const beginShiftSession = () => {
+    if (shiftSessionRef.current) return;
+    pushUndoSnapshot(headChannels);
+    shiftSessionRef.current = true;
+  };
+
+  const endShiftSession = () => {
+    shiftSessionRef.current = false;
+  };
+
+  const handleUndo = () => {
+    if (undoStack.length === 0) return;
+    const nextUndo = [...undoStack];
+    const previous = nextUndo.pop();
+    if (!previous) return;
+    shiftSessionRef.current = false;
+    setUndoStack(nextUndo);
+    setRedoStack(prev => [...prev, cloneHeads(headChannels)].slice(-50));
+    setHeadChannels(cloneHeads(previous));
+  };
+
+  const handleRedo = () => {
+    if (redoStack.length === 0) return;
+    const nextRedo = [...redoStack];
+    const restored = nextRedo.pop();
+    if (!restored) return;
+    shiftSessionRef.current = false;
+    setRedoStack(nextRedo);
+    setUndoStack(prev => [...prev, cloneHeads(headChannels)].slice(-50));
+    setHeadChannels(cloneHeads(restored));
+  };
+
+  const resolveHeadDropIndex = (clientX: number, clientY: number) => {
+    if (typeof document === 'undefined') return null;
+    const element = document.elementFromPoint(clientX, clientY) as HTMLElement | null;
+    const row = element?.closest('[data-head-row]') as HTMLElement | null;
+    if (!row) return null;
+    const idxRaw = row.getAttribute('data-head-index');
+    if (idxRaw == null) return null;
+    const idx = Number(idxRaw);
+    return Number.isFinite(idx) ? idx : null;
+  };
+
+  const addHeadDragListeners = () => {
+    if (typeof window === 'undefined' || headDragHandlersRef.current) return;
+    const move = (event: globalThis.PointerEvent) => handleHeadPointerMove(event as unknown as PointerEvent);
+    const up = (event: globalThis.PointerEvent) => finalizeHeadDrag(event as unknown as PointerEvent);
+    const cancel = (event: globalThis.PointerEvent) => finalizeHeadDrag(event as unknown as PointerEvent);
+    window.addEventListener('pointermove', move);
+    window.addEventListener('pointerup', up);
+    window.addEventListener('pointercancel', cancel);
+    headDragHandlersRef.current = { move, up, cancel };
+  };
+
+  const removeHeadDragListeners = () => {
+    if (typeof window === 'undefined') return;
+    const handlers = headDragHandlersRef.current;
+    if (!handlers) return;
+    window.removeEventListener('pointermove', handlers.move);
+    window.removeEventListener('pointerup', handlers.up);
+    window.removeEventListener('pointercancel', handlers.cancel);
+    headDragHandlersRef.current = null;
+  };
+
+  const moveHead = (fromIndex: number, toIndex: number) => {
+    if (fromIndex === toIndex) return;
+    pushUndoSnapshot(headChannels);
+    setHeadChannels(prev => {
+      if (fromIndex < 0 || fromIndex >= prev.length) return prev;
+      let target = Math.max(0, Math.min(prev.length - 1, toIndex));
+      const next = [...prev];
+      const [moved] = next.splice(fromIndex, 1);
+      if (!moved) return prev;
+      if (target > fromIndex) target -= 1;
+      next.splice(target, 0, moved);
+      return next;
+    });
+  };
+
+  const startHeadDrag = (event: PointerEvent, index: number) => {
+    event.preventDefault();
+    event.stopPropagation();
+    headDragRef.current = { pointerId: event.pointerId, fromIndex: index };
+    setHeadDragOverIndex(index);
+    addHeadDragListeners();
+    const target = event.currentTarget as HTMLElement | null;
+    if (target?.setPointerCapture) {
+      try {
+        target.setPointerCapture(event.pointerId);
+      } catch {
+        // Ignore pointer capture errors
+      }
+    }
+  };
+
+  const handleHeadPointerMove = (event: PointerEvent) => {
+    const state = headDragRef.current;
+    if (!state || state.pointerId !== event.pointerId) return;
+    const idx = resolveHeadDropIndex(event.clientX, event.clientY);
+    if (idx == null) return;
+    setHeadDragOverIndex(idx);
+  };
+
+  const finalizeHeadDrag = (event: PointerEvent) => {
+    const state = headDragRef.current;
+    if (!state || state.pointerId !== event.pointerId) return;
+    const idx = resolveHeadDropIndex(event.clientX, event.clientY);
+    if (idx != null) {
+      moveHead(state.fromIndex, idx);
+    }
+    headDragRef.current = null;
+    setHeadDragOverIndex(null);
+    removeHeadDragListeners();
+    const target = event.currentTarget as HTMLElement | null;
+    if (target?.releasePointerCapture) {
+      try {
+        target.releasePointerCapture(event.pointerId);
+      } catch {
+        // Ignore pointer release errors
+      }
+    }
+  };
+
   // Add new head channel
   const addHeadChannel = () => {
     const defaultColor = COLOR_PRESETS[0]?.value || '#10b981';
@@ -1058,6 +1628,7 @@ export function ImportTimelineCustomize({ onClose }: ImportTimelineCustomizeProp
       color: defaultColor,
       status: ''
     };
+    pushUndoSnapshot(headChannels);
     setHeadChannels([...headChannels, newHead]);
   };
 
@@ -1072,16 +1643,19 @@ export function ImportTimelineCustomize({ onClose }: ImportTimelineCustomizeProp
         return next;
       });
     }
+    pushUndoSnapshot(headChannels);
     setHeadChannels(headChannels.filter(h => h.id !== headId));
   };
 
   // Update head channel
   const updateHeadChannel = (headId: string, updates: Partial<ImportHeadChannel>) => {
+    pushUndoSnapshot(headChannels);
     setHeadChannels(headChannels.map(h => h.id === headId ? { ...h, ...updates } : h));
   };
 
   // Toggle head channel expand
   const toggleHeadExpand = (headId: string) => {
+    pushUndoSnapshot(headChannels);
     setHeadChannels(headChannels.map(h => h.id === headId ? { ...h, expanded: !h.expanded } : h));
   };
 
@@ -1094,6 +1668,7 @@ export function ImportTimelineCustomize({ onClose }: ImportTimelineCustomizeProp
     const defaultColor = head.color || COLOR_PRESETS[0]?.value || '#10b981';
     const subId = generateId();
     
+    pushUndoSnapshot(headChannels);
     setHeadChannels(headChannels.map(h => {
       if (h.id !== headId) return h;
       const newSub: ImportSubChannel = {
@@ -1113,6 +1688,7 @@ export function ImportTimelineCustomize({ onClose }: ImportTimelineCustomizeProp
   // Add cutoff timer
   const addCutoffTimer = (headId: string) => {
     const subId = generateId();
+    pushUndoSnapshot(headChannels);
     setHeadChannels(headChannels.map(h => {
       if (h.id !== headId) return h;
       const cutoffCount = h.subChannels.filter(s => s.isCutoff).length;
@@ -1137,6 +1713,7 @@ export function ImportTimelineCustomize({ onClose }: ImportTimelineCustomizeProp
       next.delete(subId);
       return next;
     });
+    pushUndoSnapshot(headChannels);
     setHeadChannels(headChannels.map(h => {
       if (h.id !== headId) return h;
       return { ...h, subChannels: h.subChannels.filter(s => s.id !== subId) };
@@ -1145,6 +1722,7 @@ export function ImportTimelineCustomize({ onClose }: ImportTimelineCustomizeProp
 
   // Update sub channel
   const updateSubChannel = (headId: string, subId: string, updates: Partial<ImportSubChannel>) => {
+    pushUndoSnapshot(headChannels);
     setHeadChannels(headChannels.map(h => {
       if (h.id !== headId) return h;
       return {
@@ -1156,6 +1734,7 @@ export function ImportTimelineCustomize({ onClose }: ImportTimelineCustomizeProp
 
   // Toggle sub channel expand
   const toggleSubExpand = (headId: string, subId: string) => {
+    pushUndoSnapshot(headChannels);
     setHeadChannels(headChannels.map(h => {
       if (h.id !== headId) return h;
       return {
@@ -1180,6 +1759,7 @@ export function ImportTimelineCustomize({ onClose }: ImportTimelineCustomizeProp
 
   // Add interval to sub channel
   const addInterval = (headId: string, subId: string) => {
+    pushUndoSnapshot(headChannels);
     setHeadChannels(headChannels.map(h => {
       if (h.id !== headId) return h;
       return {
@@ -1223,6 +1803,7 @@ export function ImportTimelineCustomize({ onClose }: ImportTimelineCustomizeProp
 
   // Delete interval
   const deleteInterval = (headId: string, subId: string, intervalId: string) => {
+    pushUndoSnapshot(headChannels);
     setHeadChannels(headChannels.map(h => {
       if (h.id !== headId) return h;
       return {
@@ -1237,6 +1818,7 @@ export function ImportTimelineCustomize({ onClose }: ImportTimelineCustomizeProp
 
   // Update interval
   const updateInterval = (headId: string, subId: string, intervalId: string, updates: Partial<TimelineInterval>) => {
+    pushUndoSnapshot(headChannels);
     setHeadChannels(headChannels.map(h => {
       if (h.id !== headId) return h;
       return {
@@ -1427,7 +2009,8 @@ export function ImportTimelineCustomize({ onClose }: ImportTimelineCustomizeProp
         })
       }));
 
-      setHeadChannels(prev => [...prev, ...imported]);
+        pushUndoSnapshot(headChannels);
+        setHeadChannels(prev => [...prev, ...imported]);
       toast.success(`Successfully imported ${imported.length} head channel(s)${hadExistingHeads ? ' (merged)' : ''}!`);
     } catch {
       toast.error('Invalid JSON format');
@@ -1563,25 +2146,99 @@ export function ImportTimelineCustomize({ onClose }: ImportTimelineCustomizeProp
         )}
 
         {/* Head Channels List */}
-        {headChannels.map((head) => {
+        {headChannels.map((head, headIndex) => {
           const summary = getHeadSummary(head);
           return (
-            <div key={head.id} className="bg-muted/50 rounded-lg p-3 space-y-2">
+            <div
+              key={head.id}
+              className={`bg-muted/50 rounded-lg p-3 space-y-2 ${headDragOverIndex === headIndex ? 'ring-2 ring-sky-400/40' : ''}`}
+              data-head-row
+              data-head-index={headIndex}
+            >
               {/* Head Channel Header */}
               <div className="flex items-center gap-2">
+                <button
+                  type="button"
+                  onPointerDown={(event) => startHeadDrag(event, headIndex)}
+                  className="w-5 h-5 rounded hover:bg-muted flex items-center justify-center text-muted-foreground cursor-grab active:cursor-grabbing"
+                  title="Drag to reorder head"
+                >
+                  <GripVertical className="w-3 h-3" />
+                </button>
                 <button onClick={() => toggleHeadExpand(head.id)} className="text-muted-foreground hover:text-foreground">
                   {head.expanded ? <ChevronDown className="w-4 h-4" /> : <ChevronRight className="w-4 h-4" />}
                 </button>
 
                 {/* Color picker */}
-                <div className="relative">
+                <div className="flex items-center gap-1">
+                  <div className="relative">
+                    <input
+                      type="color"
+                      value={head.color}
+                      onChange={(e) => {
+                        const value = e.target.value;
+                        setHeadColorDraft(prev => ({ ...prev, [head.id]: value }));
+                        if (value !== head.color) updateHeadChannel(head.id, { color: value });
+                      }}
+                      className="w-5 h-5 rounded cursor-pointer border-0 bg-transparent"
+                      title="Head color"
+                    />
+                  </div>
                   <input
-                    type="color"
-                    value={head.color}
-                    onChange={(e) => updateHeadChannel(head.id, { color: e.target.value })}
-                    className="w-5 h-5 rounded cursor-pointer border-0 bg-transparent"
-                    title="Head color"
+                    type="text"
+                    value={headColorDraft[head.id] ?? head.color}
+                    onChange={(e) => {
+                      const raw = e.target.value;
+                      setHeadColorDraft(prev => ({ ...prev, [head.id]: raw }));
+                      const normalized = normalizeColorCode(raw);
+                      if (normalized && normalized !== head.color) {
+                        updateHeadChannel(head.id, { color: normalized });
+                      }
+                    }}
+                    onBlur={() => {
+                      const raw = headColorDraft[head.id] ?? head.color;
+                      const normalized = normalizeColorCode(raw);
+                      if (normalized) {
+                        setHeadColorDraft(prev => ({ ...prev, [head.id]: normalized }));
+                        if (normalized !== head.color) updateHeadChannel(head.id, { color: normalized });
+                      } else {
+                        setHeadColorDraft(prev => ({ ...prev, [head.id]: head.color }));
+                      }
+                    }}
+                    onKeyDown={(e) => {
+                      if (e.key !== 'Enter') return;
+                      const raw = headColorDraft[head.id] ?? head.color;
+                      const normalized = normalizeColorCode(raw);
+                      if (normalized) {
+                        setHeadColorDraft(prev => ({ ...prev, [head.id]: normalized }));
+                        if (normalized !== head.color) updateHeadChannel(head.id, { color: normalized });
+                      } else {
+                        setHeadColorDraft(prev => ({ ...prev, [head.id]: head.color }));
+                      }
+                    }}
+                    className="w-20 bg-muted rounded px-1.5 py-0.5 text-[10px] font-mono text-foreground focus:outline-none focus:ring-1 focus:ring-primary/50"
+                    placeholder="#10b981"
+                    title="Head color code"
                   />
+                  <button
+                    type="button"
+                    onClick={() => handleCopyColorCode(head.color)}
+                    className="px-1.5 py-0.5 text-[10px] rounded border border-border/60 text-muted-foreground hover:text-foreground hover:bg-muted/50"
+                    title="Copy head color"
+                  >
+                    Copy
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => handlePasteColorCode((color) => {
+                      setHeadColorDraft(prev => ({ ...prev, [head.id]: color }));
+                      if (color !== head.color) updateHeadChannel(head.id, { color });
+                    }, headColorDraft[head.id] ?? head.color)}
+                    className="px-1.5 py-0.5 text-[10px] rounded border border-border/60 text-muted-foreground hover:text-foreground hover:bg-muted/50"
+                    title="Paste head color"
+                  >
+                    Paste
+                  </button>
                 </div>
 
                 <input
@@ -1684,13 +2341,74 @@ export function ImportTimelineCustomize({ onClose }: ImportTimelineCustomizeProp
                         </button>
 
                         {/* Color picker */}
-                        <input
-                          type="color"
-                          value={sub.color}
-                          onChange={(e) => updateSubChannel(head.id, sub.id, { color: e.target.value })}
-                          className="w-4 h-4 rounded cursor-pointer border-0 bg-transparent"
-                          title="Sub color"
-                        />
+                        <div className="flex items-center gap-1">
+                          <input
+                            type="color"
+                            value={sub.color}
+                            onChange={(e) => {
+                              const value = e.target.value;
+                              setSubColorDraft(prev => ({ ...prev, [sub.id]: value }));
+                              if (value !== sub.color) updateSubChannel(head.id, sub.id, { color: value });
+                            }}
+                            className="w-4 h-4 rounded cursor-pointer border-0 bg-transparent"
+                            title="Sub color"
+                          />
+                          <input
+                            type="text"
+                            value={subColorDraft[sub.id] ?? sub.color}
+                            onChange={(e) => {
+                              const raw = e.target.value;
+                              setSubColorDraft(prev => ({ ...prev, [sub.id]: raw }));
+                              const normalized = normalizeColorCode(raw);
+                              if (normalized && normalized !== sub.color) {
+                                updateSubChannel(head.id, sub.id, { color: normalized });
+                              }
+                            }}
+                            onBlur={() => {
+                              const raw = subColorDraft[sub.id] ?? sub.color;
+                              const normalized = normalizeColorCode(raw);
+                              if (normalized) {
+                                setSubColorDraft(prev => ({ ...prev, [sub.id]: normalized }));
+                                if (normalized !== sub.color) updateSubChannel(head.id, sub.id, { color: normalized });
+                              } else {
+                                setSubColorDraft(prev => ({ ...prev, [sub.id]: sub.color }));
+                              }
+                            }}
+                            onKeyDown={(e) => {
+                              if (e.key !== 'Enter') return;
+                              const raw = subColorDraft[sub.id] ?? sub.color;
+                              const normalized = normalizeColorCode(raw);
+                              if (normalized) {
+                                setSubColorDraft(prev => ({ ...prev, [sub.id]: normalized }));
+                                if (normalized !== sub.color) updateSubChannel(head.id, sub.id, { color: normalized });
+                              } else {
+                                setSubColorDraft(prev => ({ ...prev, [sub.id]: sub.color }));
+                              }
+                            }}
+                            className="w-16 bg-muted rounded px-1 py-0.5 text-[9px] font-mono text-foreground focus:outline-none focus:ring-1 focus:ring-primary/50"
+                            placeholder="#10b981"
+                            title="Sub color code"
+                          />
+                          <button
+                            type="button"
+                            onClick={() => handleCopyColorCode(sub.color)}
+                            className="px-1 py-0.5 text-[9px] rounded border border-border/60 text-muted-foreground hover:text-foreground hover:bg-muted/50"
+                            title="Copy sub color"
+                          >
+                            Copy
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => handlePasteColorCode((color) => {
+                              setSubColorDraft(prev => ({ ...prev, [sub.id]: color }));
+                              if (color !== sub.color) updateSubChannel(head.id, sub.id, { color });
+                            }, subColorDraft[sub.id] ?? sub.color)}
+                            className="px-1 py-0.5 text-[9px] rounded border border-border/60 text-muted-foreground hover:text-foreground hover:bg-muted/50"
+                            title="Paste sub color"
+                          >
+                            Paste
+                          </button>
+                        </div>
 
                         <input
                           type="text"
@@ -1745,13 +2463,74 @@ export function ImportTimelineCustomize({ onClose }: ImportTimelineCustomizeProp
                           {sub.intervals.map((interval, idx) => (
                             <div key={interval.id} className="flex items-center gap-2 text-[10px]">
                               {/* Color picker for interval */}
-                              <input
-                                type="color"
-                                value={interval.color}
-                                onChange={(e) => updateInterval(head.id, sub.id, interval.id, { color: e.target.value })}
-                                className="w-4 h-4 rounded cursor-pointer border-0 bg-transparent flex-shrink-0"
-                                title="Timeline color"
-                              />
+                              <div className="flex items-center gap-1">
+                                <input
+                                  type="color"
+                                  value={interval.color}
+                                  onChange={(e) => {
+                                    const value = e.target.value;
+                                    setIntervalColorDraft(prev => ({ ...prev, [interval.id]: value }));
+                                    if (value !== interval.color) updateInterval(head.id, sub.id, interval.id, { color: value });
+                                  }}
+                                  className="w-4 h-4 rounded cursor-pointer border-0 bg-transparent flex-shrink-0"
+                                  title="Timeline color"
+                                />
+                                <input
+                                  type="text"
+                                  value={intervalColorDraft[interval.id] ?? interval.color}
+                                  onChange={(e) => {
+                                    const raw = e.target.value;
+                                    setIntervalColorDraft(prev => ({ ...prev, [interval.id]: raw }));
+                                    const normalized = normalizeColorCode(raw);
+                                    if (normalized && normalized !== interval.color) {
+                                      updateInterval(head.id, sub.id, interval.id, { color: normalized });
+                                    }
+                                  }}
+                                  onBlur={() => {
+                                    const raw = intervalColorDraft[interval.id] ?? interval.color;
+                                    const normalized = normalizeColorCode(raw);
+                                    if (normalized) {
+                                      setIntervalColorDraft(prev => ({ ...prev, [interval.id]: normalized }));
+                                      if (normalized !== interval.color) updateInterval(head.id, sub.id, interval.id, { color: normalized });
+                                    } else {
+                                      setIntervalColorDraft(prev => ({ ...prev, [interval.id]: interval.color }));
+                                    }
+                                  }}
+                                  onKeyDown={(e) => {
+                                    if (e.key !== 'Enter') return;
+                                    const raw = intervalColorDraft[interval.id] ?? interval.color;
+                                    const normalized = normalizeColorCode(raw);
+                                    if (normalized) {
+                                      setIntervalColorDraft(prev => ({ ...prev, [interval.id]: normalized }));
+                                      if (normalized !== interval.color) updateInterval(head.id, sub.id, interval.id, { color: normalized });
+                                    } else {
+                                      setIntervalColorDraft(prev => ({ ...prev, [interval.id]: interval.color }));
+                                    }
+                                  }}
+                                  className="w-16 bg-muted rounded px-1 py-0.5 text-[9px] font-mono text-foreground focus:outline-none focus:ring-1 focus:ring-primary/50"
+                                  placeholder="#10b981"
+                                  title="Timeline color code"
+                                />
+                                <button
+                                  type="button"
+                                  onClick={() => handleCopyColorCode(interval.color)}
+                                  className="px-1 py-0.5 text-[9px] rounded border border-border/60 text-muted-foreground hover:text-foreground hover:bg-muted/50"
+                                  title="Copy timeline color"
+                                >
+                                  Copy
+                                </button>
+                                <button
+                                  type="button"
+                                  onClick={() => handlePasteColorCode((color) => {
+                                    setIntervalColorDraft(prev => ({ ...prev, [interval.id]: color }));
+                                    if (color !== interval.color) updateInterval(head.id, sub.id, interval.id, { color });
+                                  }, intervalColorDraft[interval.id] ?? interval.color)}
+                                  className="px-1 py-0.5 text-[9px] rounded border border-border/60 text-muted-foreground hover:text-foreground hover:bg-muted/50"
+                                  title="Paste timeline color"
+                                >
+                                  Paste
+                                </button>
+                              </div>
                               <span className="text-muted-foreground w-4">{idx + 1}.</span>
 
                               {mode === 'time' ? (
@@ -2081,7 +2860,57 @@ export function ImportTimelineCustomize({ onClose }: ImportTimelineCustomizeProp
                 <Settings2 className="w-3.5 h-3.5" />
                 Graph Settings
               </button>
-              
+
+              <button
+                onClick={() => setReorderSubEnabled(prev => !prev)}
+                className={`flex items-center gap-2 px-4 py-2 text-xs font-medium rounded-full transition-all ${
+                  reorderSubEnabled
+                    ? 'bg-emerald-500/15 text-emerald-400 border border-emerald-500/30 hover:bg-emerald-500/25'
+                    : 'bg-secondary text-muted-foreground border border-border hover:bg-secondary/80'
+                }`}
+                title="Drag sub head graphs to reorder or move to another head"
+              >
+                {reorderSubEnabled ? 'Drag & Drop On' : 'Drag & Drop Off'}
+              </button>
+
+              <button
+                onClick={() => setShiftTimeEnabled(prev => !prev)}
+                className={`flex items-center gap-2 px-4 py-2 text-xs font-medium rounded-full transition-all ${
+                  shiftTimeEnabled
+                    ? 'bg-sky-500/15 text-sky-400 border border-sky-500/30 hover:bg-sky-500/25'
+                    : 'bg-secondary text-muted-foreground border border-border hover:bg-secondary/80'
+                }`}
+                title="Drag sub head bars left/right to shift time"
+              >
+                {shiftTimeEnabled ? 'Shift Time On' : 'Shift Time Off'}
+              </button>
+
+              <button
+                onClick={handleUndo}
+                disabled={undoStack.length === 0}
+                className={`flex items-center gap-2 px-4 py-2 text-xs font-medium rounded-full transition-all ${
+                  undoStack.length > 0
+                    ? 'bg-secondary text-foreground border border-border hover:bg-secondary/80'
+                    : 'bg-muted text-muted-foreground border border-border/60 cursor-not-allowed'
+                }`}
+                title="Undo last change"
+              >
+                Undo
+              </button>
+
+              <button
+                onClick={handleRedo}
+                disabled={redoStack.length === 0}
+                className={`flex items-center gap-2 px-4 py-2 text-xs font-medium rounded-full transition-all ${
+                  redoStack.length > 0
+                    ? 'bg-secondary text-foreground border border-border hover:bg-secondary/80'
+                    : 'bg-muted text-muted-foreground border border-border/60 cursor-not-allowed'
+                }`}
+                title="Redo"
+              >
+                Redo
+              </button>
+               
               <button
                 onClick={() => setShowCutoffVisual(!showCutoffVisual)}
                 className={`flex items-center gap-2 px-4 py-2 text-xs font-medium rounded-full transition-all ${
@@ -2113,6 +2942,12 @@ export function ImportTimelineCustomize({ onClose }: ImportTimelineCustomizeProp
               mode={mode}
               visibleStatusLabels={visibleStatusLabels}
               visualSettings={visualSettings}
+              reorderEnabled={reorderSubEnabled}
+              shiftTimeEnabled={shiftTimeEnabled}
+              onMoveSubChannel={moveSubChannel}
+              onShiftSubChannel={shiftSubChannelBy}
+              onShiftSessionStart={beginShiftSession}
+              onShiftSessionEnd={endShiftSession}
               onOpenSettings={() => setShowVisualSettings(true)}
             />
           </VisualizationErrorBoundary>
