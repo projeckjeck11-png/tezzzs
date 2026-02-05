@@ -304,12 +304,14 @@ interface TimelineVisualizationProps {
   onMoveSubChannel?: (fromHeadId: string, subId: string, toHeadId: string, toIndex: number | null) => void;
   onShiftSubChannel?: (headId: string, subId: string, deltaMins: number) => void;
   onUpdateInterval?: (headId: string, subId: string, intervalId: string, updates: Partial<TimelineInterval>) => void;
+  onCopyColorCode?: (value: string) => void;
+  onPasteColorCode?: (apply: (color: string) => void, fallbackValue?: string | null) => void;
   onShiftSessionStart?: () => void;
   onShiftSessionEnd?: () => void;
   onOpenSettings?: () => void;
 }
 
-function TimelineVisualization({ headChannels, showCutoff, customLabels, mode, visibleStatusLabels, visualSettings, reorderEnabled, shiftTimeEnabled, onMoveSubChannel, onShiftSubChannel, onUpdateInterval, onShiftSessionStart, onShiftSessionEnd, onOpenSettings }: TimelineVisualizationProps) {
+function TimelineVisualization({ headChannels, showCutoff, customLabels, mode, visibleStatusLabels, visualSettings, reorderEnabled, shiftTimeEnabled, onMoveSubChannel, onShiftSubChannel, onUpdateInterval, onCopyColorCode, onPasteColorCode, onShiftSessionStart, onShiftSessionEnd, onOpenSettings }: TimelineVisualizationProps) {
   const vs = visualSettings;
   const canReorder = reorderEnabled && typeof onMoveSubChannel === 'function';
   const canShiftTime = shiftTimeEnabled && typeof onShiftSubChannel === 'function';
@@ -350,6 +352,12 @@ function TimelineVisualization({ headChannels, showCutoff, customLabels, mode, v
   const [editStartValue, setEditStartValue] = useState('');
   const [editEndValue, setEditEndValue] = useState('');
   const [editDurationValue, setEditDurationValue] = useState('');
+  const [editingColor, setEditingColor] = useState<{
+    headId: string;
+    subId: string;
+    intervalId: string;
+  } | null>(null);
+  const [editColorValue, setEditColorValue] = useState('');
 
   const isSubSelected = (headId: string, subId: string) =>
     selectedSubs.some(entry => entry.headId === headId && entry.subId === subId);
@@ -413,6 +421,14 @@ function TimelineVisualization({ headChannels, showCutoff, customLabels, mode, v
     return Math.round(num);
   };
 
+  const normalizeColorCodeLocal = (value?: string | null) => {
+    const raw = (value || '').trim();
+    if (!raw) return null;
+    const match = raw.match(/^#?([0-9a-f]{3}|[0-9a-f]{6})$/i);
+    if (!match) return null;
+    return `#${match[1].toLowerCase()}`;
+  };
+
   const parseTimeInput = (value: string) => {
     if (!value || typeof value !== 'string' || !value.includes(':')) return null;
     const [hoursRaw, minutesRaw] = value.split(':');
@@ -466,6 +482,20 @@ function TimelineVisualization({ headChannels, showCutoff, customLabels, mode, v
     setContextMenu(null);
   };
 
+  const openColorEditor = (headId: string, subId: string, intervalId: string) => {
+    const head = headChannels.find(h => h.id === headId);
+    const sub = head?.subChannels?.find(s => s.id === subId);
+    const interval = sub?.intervals?.find(i => i.id === intervalId);
+    if (!interval) {
+      setContextMenu(null);
+      return;
+    }
+    const normalized = normalizeColorCodeLocal(interval.color) ?? interval.color;
+    setEditingColor({ headId, subId, intervalId });
+    setEditColorValue(normalized || '#10b981');
+    setContextMenu(null);
+  };
+
   const handleEditStartChange = (value: string) => {
     setEditStartValue(value);
     const startMin = parseInputToMinutes(value);
@@ -512,10 +542,33 @@ function TimelineVisualization({ headChannels, showCutoff, customLabels, mode, v
     setEditingInterval(null);
   };
 
+  const applyColorEdit = () => {
+    if (!editingColor || !onUpdateInterval) return;
+    const normalized = normalizeColorCodeLocal(editColorValue);
+    if (!normalized) {
+      toast.error('Invalid color');
+      return;
+    }
+    onUpdateInterval(editingColor.headId, editingColor.subId, editingColor.intervalId, {
+      color: normalized
+    });
+    setEditingColor(null);
+  };
+
   const editingMeta = editingInterval
     ? (() => {
         const head = headChannels.find(h => h.id === editingInterval.headId);
         const sub = head?.subChannels?.find(s => s.id === editingInterval.subId);
+        return {
+          headName: head?.name ?? 'Head',
+          subName: sub?.name ?? 'Sub'
+        };
+      })()
+    : null;
+  const editingColorMeta = editingColor
+    ? (() => {
+        const head = headChannels.find(h => h.id === editingColor.headId);
+        const sub = head?.subChannels?.find(s => s.id === editingColor.subId);
         return {
           headName: head?.name ?? 'Head',
           subName: sub?.name ?? 'Sub'
@@ -1263,6 +1316,12 @@ function TimelineVisualization({ headChannels, showCutoff, customLabels, mode, v
             >
               Edit Timeline
             </button>
+            <button
+              className="w-full text-left px-2 py-1.5 rounded hover:bg-secondary transition-colors"
+              onClick={() => openColorEditor(contextMenu.headId, contextMenu.subId, contextMenu.intervalId)}
+            >
+              Edit Color
+            </button>
           </div>
         </div>
       )}
@@ -1336,6 +1395,81 @@ function TimelineVisualization({ headChannels, showCutoff, customLabels, mode, v
               <button
                 className="px-3 py-1.5 text-xs rounded-md bg-primary text-primary-foreground hover:bg-primary/90"
                 onClick={applyIntervalEdit}
+              >
+                Save
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {editingColor && (
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm"
+          onClick={() => setEditingColor(null)}
+        >
+          <div
+            className="bg-background border border-border rounded-2xl shadow-2xl w-full max-w-sm m-4 overflow-hidden"
+            onClick={event => event.stopPropagation()}
+          >
+            <div className="flex items-center justify-between px-4 py-3 border-b border-border bg-secondary/30">
+              <div>
+                <h4 className="text-sm font-semibold text-foreground">Edit Color</h4>
+                <p className="text-[10px] text-muted-foreground">{editingColorMeta?.headName} · {editingColorMeta?.subName}</p>
+              </div>
+              <button
+                className="w-7 h-7 rounded-full bg-muted/80 hover:bg-destructive hover:text-white flex items-center justify-center transition-all"
+                onClick={() => setEditingColor(null)}
+                aria-label="Close"
+              >
+                <X className="w-3.5 h-3.5" />
+              </button>
+            </div>
+            <div className="p-4 space-y-3">
+              <div className="flex items-center gap-2">
+                <input
+                  type="color"
+                  value={normalizeColorCodeLocal(editColorValue) ?? '#10b981'}
+                  onChange={event => setEditColorValue(event.target.value)}
+                  className="w-10 h-9 p-0 border border-border rounded"
+                />
+                <input
+                  type="text"
+                  value={editColorValue}
+                  onChange={event => setEditColorValue(event.target.value)}
+                  className="flex-1 px-2 py-1 rounded border border-border bg-background text-xs"
+                  placeholder="#10b981"
+                />
+              </div>
+              <div className="flex items-center gap-2">
+                {onCopyColorCode && (
+                  <button
+                    className="px-3 py-1.5 text-xs rounded-md border border-border bg-background hover:bg-secondary"
+                    onClick={() => onCopyColorCode(editColorValue)}
+                  >
+                    Copy
+                  </button>
+                )}
+                {onPasteColorCode && (
+                  <button
+                    className="px-3 py-1.5 text-xs rounded-md border border-border bg-background hover:bg-secondary"
+                    onClick={() => onPasteColorCode(color => setEditColorValue(color), editColorValue)}
+                  >
+                    Paste
+                  </button>
+                )}
+              </div>
+            </div>
+            <div className="flex items-center justify-end gap-2 px-4 py-3 border-t border-border bg-secondary/20">
+              <button
+                className="px-3 py-1.5 text-xs rounded-md border border-border bg-background hover:bg-secondary"
+                onClick={() => setEditingColor(null)}
+              >
+                Cancel
+              </button>
+              <button
+                className="px-3 py-1.5 text-xs rounded-md bg-primary text-primary-foreground hover:bg-primary/90"
+                onClick={applyColorEdit}
               >
                 Save
               </button>
@@ -3293,6 +3427,8 @@ export function ImportTimelineCustomize({ onClose }: ImportTimelineCustomizeProp
                 onMoveSubChannel={moveSubChannel}
                 onShiftSubChannel={shiftSubChannelBy}
                 onUpdateInterval={updateInterval}
+                onCopyColorCode={handleCopyColorCode}
+                onPasteColorCode={handlePasteColorCode}
                 onShiftSessionStart={beginShiftSession}
                 onShiftSessionEnd={endShiftSession}
                 onOpenSettings={() => setShowVisualSettings(true)}
