@@ -1,4 +1,4 @@
-import { useState, useRef, useEffect, type PointerEvent } from 'react';
+import { useState, useRef, useEffect, type PointerEvent, type MouseEvent } from 'react';
 import { X, Plus, Trash2, Eye, EyeOff, ChevronDown, ChevronRight, Scissors, FileText, Clock, Save, Upload, Copy, Check, Tag, Settings2, GripVertical } from 'lucide-react';
 import { toast } from 'sonner';
 import { CursorTooltip } from '@/components/CursorTooltip';
@@ -185,8 +185,8 @@ function getSlicedSegments(
   cutoffs: CutoffInterval[],
   totalDurationMins: number,
   offsetMins: number = 0
-): { id: string; left: number; width: number; startMin: number; endMin: number; color: string }[] {
-  const result: { id: string; left: number; width: number; startMin: number; endMin: number; color: string }[] = [];
+): { id: string; intervalId: string; left: number; width: number; startMin: number; endMin: number; color: string }[] {
+  const result: { id: string; intervalId: string; left: number; width: number; startMin: number; endMin: number; color: string }[] = [];
   
   for (const interval of intervals) {
     const intStart = interval.startMin;
@@ -216,6 +216,7 @@ function getSlicedSegments(
       const width = ((seg.end - seg.start) / totalDurationMins) * 100;
       result.push({
         id: `${interval.id}-seg-${i}`,
+        intervalId: interval.id,
         left,
         width,
         startMin: seg.start,
@@ -302,18 +303,19 @@ interface TimelineVisualizationProps {
   shiftTimeEnabled: boolean;
   onMoveSubChannel?: (fromHeadId: string, subId: string, toHeadId: string, toIndex: number | null) => void;
   onShiftSubChannel?: (headId: string, subId: string, deltaMins: number) => void;
+  onUpdateInterval?: (headId: string, subId: string, intervalId: string, updates: Partial<TimelineInterval>) => void;
   onShiftSessionStart?: () => void;
   onShiftSessionEnd?: () => void;
   onOpenSettings?: () => void;
 }
 
-function TimelineVisualization({ headChannels, showCutoff, customLabels, mode, visibleStatusLabels, visualSettings, reorderEnabled, shiftTimeEnabled, onMoveSubChannel, onShiftSubChannel, onShiftSessionStart, onShiftSessionEnd, onOpenSettings }: TimelineVisualizationProps) {
+function TimelineVisualization({ headChannels, showCutoff, customLabels, mode, visibleStatusLabels, visualSettings, reorderEnabled, shiftTimeEnabled, onMoveSubChannel, onShiftSubChannel, onUpdateInterval, onShiftSessionStart, onShiftSessionEnd, onOpenSettings }: TimelineVisualizationProps) {
   const vs = visualSettings;
   const canReorder = reorderEnabled && typeof onMoveSubChannel === 'function';
   const canShiftTime = shiftTimeEnabled && typeof onShiftSubChannel === 'function';
   const [draggingSub, setDraggingSub] = useState<{ headId: string; subId: string } | null>(null);
   const [shiftingSub, setShiftingSub] = useState<{ headId: string; subId: string } | null>(null);
-  const [selectedSub, setSelectedSub] = useState<{ headId: string; subId: string } | null>(null);
+  const [selectedSubs, setSelectedSubs] = useState<Array<{ headId: string; subId: string }>>([]);
   const [dragOverTarget, setDragOverTarget] = useState<{ headId: string; index: number | null } | null>(null);
   const dragStateRef = useRef<{ pointerId: number; headId: string; subId: string } | null>(null);
   const timeShiftRef = useRef<{
@@ -326,15 +328,203 @@ function TimelineVisualization({ headChannels, showCutoff, customLabels, mode, v
     trackWidth: number;
     minDelta: number;
     maxDelta: number;
+    selected: Array<{ headId: string; subId: string }>;
   } | null>(null);
   const windowHandlersRef = useRef<{
     move: (event: globalThis.PointerEvent) => void;
     up: (event: globalThis.PointerEvent) => void;
     cancel: (event: globalThis.PointerEvent) => void;
   } | null>(null);
+  const [contextMenu, setContextMenu] = useState<{
+    x: number;
+    y: number;
+    headId: string;
+    subId: string;
+    intervalId: string;
+  } | null>(null);
+  const [editingInterval, setEditingInterval] = useState<{
+    headId: string;
+    subId: string;
+    intervalId: string;
+  } | null>(null);
+  const [editStartValue, setEditStartValue] = useState('');
+  const [editEndValue, setEditEndValue] = useState('');
+  const [editDurationValue, setEditDurationValue] = useState('');
+
+  const isSubSelected = (headId: string, subId: string) =>
+    selectedSubs.some(entry => entry.headId === headId && entry.subId === subId);
+
+  const toggleSubSelection = (headId: string, subId: string) => {
+    setSelectedSubs(prev => {
+      const exists = prev.some(entry => entry.headId === headId && entry.subId === subId);
+      if (exists) {
+        return prev.filter(entry => !(entry.headId === headId && entry.subId === subId));
+      }
+      return [...prev, { headId, subId }];
+    });
+  };
+
+  const ensureSelectionForShift = (headId: string, subId: string) => {
+    if (isSubSelected(headId, subId)) return selectedSubs;
+    const next = [{ headId, subId }];
+    setSelectedSubs(next);
+    return next;
+  };
+
+  const resolveSelectionTargets = (selection: Array<{ headId: string; subId: string }>) => {
+    const targets: Array<{ head: ImportHeadChannel; sub: ImportSubChannel }> = [];
+    for (const entry of selection) {
+      const head = headChannels.find(h => h.id === entry.headId);
+      const sub = head?.subChannels?.find(s => s.id === entry.subId);
+      if (head && sub) {
+        targets.push({ head, sub });
+      }
+    }
+    return targets;
+  };
+
+  const getSelectionBounds = (targets: Array<{ head: ImportHeadChannel; sub: ImportSubChannel }>) => {
+    let min = -Infinity;
+    let max = Infinity;
+    for (const target of targets) {
+      const bounds = getSubShiftBounds(target.head, target.sub, mode);
+      min = Math.max(min, bounds.min);
+      max = Math.min(max, bounds.max);
+    }
+    if (!Number.isFinite(min) || !Number.isFinite(max)) return null;
+    return { min, max };
+  };
+
+  const applyShiftToSelection = (selection: Array<{ headId: string; subId: string }>, deltaMins: number) => {
+    if (!onShiftSubChannel || deltaMins === 0) return 0;
+    let applied = 0;
+    for (const entry of selection) {
+      const result = onShiftSubChannel(entry.headId, entry.subId, deltaMins) ?? 0;
+      if (result !== 0) applied = deltaMins;
+    }
+    return applied;
+  };
+
+  const parseMinutesInput = (value: string) => {
+    const trimmed = value.trim();
+    if (trimmed.length === 0) return null;
+    const num = Number(trimmed);
+    if (!Number.isFinite(num)) return null;
+    return Math.round(num);
+  };
+
+  const parseTimeInput = (value: string) => {
+    if (!value || typeof value !== 'string' || !value.includes(':')) return null;
+    const [hoursRaw, minutesRaw] = value.split(':');
+    const hours = Number(hoursRaw);
+    const minutes = Number(minutesRaw);
+    if (!Number.isFinite(hours) || !Number.isFinite(minutes)) return null;
+    if (hours < 0 || hours > 23 || minutes < 0 || minutes > 59) return null;
+    return hours * 60 + minutes;
+  };
+
+  const parseInputToMinutes = (value: string) => {
+    if (mode === 'oclock') return parseTimeInput(value);
+    return parseMinutesInput(value);
+  };
+
+  const formatMinutesToInput = (mins: number) => {
+    if (mode === 'oclock') return minutesToTime(Math.max(0, mins));
+    return String(Math.max(0, Math.round(mins)));
+  };
+
+  const handleSegmentContextMenu = (
+    event: MouseEvent<HTMLDivElement>,
+    headId: string,
+    subId: string,
+    intervalId: string
+  ) => {
+    if (!onUpdateInterval) return;
+    event.preventDefault();
+    event.stopPropagation();
+    setContextMenu({
+      x: event.clientX,
+      y: event.clientY,
+      headId,
+      subId,
+      intervalId
+    });
+  };
+
+  const openIntervalEditor = (headId: string, subId: string, intervalId: string) => {
+    const head = headChannels.find(h => h.id === headId);
+    const sub = head?.subChannels?.find(s => s.id === subId);
+    const interval = sub?.intervals?.find(i => i.id === intervalId);
+    if (!interval) {
+      setContextMenu(null);
+      return;
+    }
+    setEditingInterval({ headId, subId, intervalId });
+    setEditStartValue(mode === 'oclock' ? interval.startTime : String(interval.startMin));
+    setEditEndValue(mode === 'oclock' ? interval.endTime : String(interval.endMin));
+    setEditDurationValue(String(Math.max(0, interval.endMin - interval.startMin)));
+    setContextMenu(null);
+  };
+
+  const handleEditStartChange = (value: string) => {
+    setEditStartValue(value);
+    const startMin = parseInputToMinutes(value);
+    const endMin = parseInputToMinutes(editEndValue);
+    if (startMin == null || endMin == null) return;
+    const duration = Math.max(0, endMin - startMin);
+    setEditDurationValue(String(duration));
+  };
+
+  const handleEditEndChange = (value: string) => {
+    setEditEndValue(value);
+    const startMin = parseInputToMinutes(editStartValue);
+    const endMin = parseInputToMinutes(value);
+    if (startMin == null || endMin == null) return;
+    const duration = Math.max(0, endMin - startMin);
+    setEditDurationValue(String(duration));
+  };
+
+  const handleEditDurationChange = (value: string) => {
+    setEditDurationValue(value);
+    const duration = parseMinutesInput(value);
+    const startMin = parseInputToMinutes(editStartValue);
+    if (duration == null || startMin == null) return;
+    const endMin = startMin + duration;
+    setEditEndValue(formatMinutesToInput(endMin));
+  };
+
+  const applyIntervalEdit = () => {
+    if (!editingInterval || !onUpdateInterval) return;
+    const startMin = parseInputToMinutes(editStartValue);
+    const endMin = parseInputToMinutes(editEndValue);
+    if (startMin == null || endMin == null) {
+      toast.error('Invalid time values');
+      return;
+    }
+    if (endMin <= startMin) {
+      toast.error('End time must be after start time');
+      return;
+    }
+    onUpdateInterval(editingInterval.headId, editingInterval.subId, editingInterval.intervalId, {
+      startMin,
+      endMin
+    });
+    setEditingInterval(null);
+  };
+
+  const editingMeta = editingInterval
+    ? (() => {
+        const head = headChannels.find(h => h.id === editingInterval.headId);
+        const sub = head?.subChannels?.find(s => s.id === editingInterval.subId);
+        return {
+          headName: head?.name ?? 'Head',
+          subName: sub?.name ?? 'Sub'
+        };
+      })()
+    : null;
 
   useEffect(() => {
-    if (!canShiftTime || !selectedSub) return;
+    if (!canShiftTime || selectedSubs.length === 0) return;
     const handleKeyDown = (event: KeyboardEvent) => {
       if (event.key !== 'ArrowLeft' && event.key !== 'ArrowRight') return;
       const target = event.target as HTMLElement | null;
@@ -342,26 +532,29 @@ function TimelineVisualization({ headChannels, showCutoff, customLabels, mode, v
       const tag = target?.tagName?.toLowerCase();
       if (tag === 'input' || tag === 'textarea' || tag === 'select') return;
 
-      const head = headChannels.find(h => h.id === selectedSub.headId);
-      const sub = head?.subChannels?.find(s => s.id === selectedSub.subId);
-      if (!head || !sub) return;
+      const targets = resolveSelectionTargets(selectedSubs);
+      if (targets.length === 0) return;
+      const bounds = getSelectionBounds(targets);
+      if (!bounds) return;
 
       event.preventDefault();
       const step = event.shiftKey ? 5 : 1;
       const delta = event.key === 'ArrowLeft' ? -step : step;
-      const bounds = getSubShiftBounds(head, sub, mode);
       const clamped = Math.min(bounds.max, Math.max(bounds.min, delta));
       if (clamped === 0) return;
-      onShiftSubChannel?.(head.id, sub.id, clamped);
+      const selectionIds = targets.map(target => ({ headId: target.head.id, subId: target.sub.id }));
+      onShiftSessionStart?.();
+      applyShiftToSelection(selectionIds, clamped);
+      onShiftSessionEnd?.();
     };
 
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [canShiftTime, selectedSub, headChannels, mode, onShiftSubChannel]);
+  }, [canShiftTime, selectedSubs, headChannels, mode, onShiftSubChannel, onShiftSessionStart, onShiftSessionEnd]);
 
   useEffect(() => {
     if (canShiftTime) return;
-    setSelectedSub(null);
+    setSelectedSubs([]);
     setShiftingSub(null);
     timeShiftRef.current = null;
     removeWindowListeners();
@@ -470,18 +663,28 @@ function TimelineVisualization({ headChannels, showCutoff, customLabels, mode, v
 
   const handleTimeShiftStart = (event: PointerEvent, head: ImportHeadChannel, sub: ImportSubChannel, durationMins: number) => {
     if (!canShiftTime) return;
+    if (event.button !== 0) return;
+    if (event.ctrlKey || event.metaKey) {
+      event.preventDefault();
+      event.stopPropagation();
+      toggleSubSelection(head.id, sub.id);
+      return;
+    }
     const intervals = sub.intervals ?? [];
     if (intervals.length === 0) return;
-    onShiftSessionStart?.();
-    setSelectedSub({ headId: head.id, subId: sub.id });
+    const selection = ensureSelectionForShift(head.id, sub.id);
+    const targets = resolveSelectionTargets(selection);
+    if (targets.length === 0) return;
+    const bounds = getSelectionBounds(targets);
+    if (!bounds || bounds.min > bounds.max) return;
     const track = event.currentTarget as HTMLElement | null;
     const trackWidth = track?.getBoundingClientRect().width ?? 0;
     if (!Number.isFinite(trackWidth) || trackWidth <= 0) return;
-    const bounds = getSubShiftBounds(head, sub, mode);
-    if (bounds.min > bounds.max) return;
 
+    onShiftSessionStart?.();
     event.preventDefault();
     event.stopPropagation();
+    const selectionIds = targets.map(target => ({ headId: target.head.id, subId: target.sub.id }));
     timeShiftRef.current = {
       pointerId: event.pointerId,
       headId: head.id,
@@ -491,7 +694,8 @@ function TimelineVisualization({ headChannels, showCutoff, customLabels, mode, v
       durationMins,
       trackWidth,
       minDelta: bounds.min,
-      maxDelta: bounds.max
+      maxDelta: bounds.max,
+      selected: selectionIds
     };
     setShiftingSub({ headId: head.id, subId: sub.id });
     addWindowListeners();
@@ -513,9 +717,9 @@ function TimelineVisualization({ headChannels, showCutoff, customLabels, mode, v
     const desiredDelta = Math.min(state.maxDelta, Math.max(state.minDelta, rawDelta));
     const step = desiredDelta - state.lastApplied;
     if (step === 0) return;
-    const applied = onShiftSubChannel?.(state.headId, state.subId, step) ?? 0;
+    const applied = applyShiftToSelection(state.selected, step);
     if (applied !== 0) {
-      state.lastApplied += applied;
+      state.lastApplied += step;
     }
   };
 
@@ -784,7 +988,7 @@ function TimelineVisualization({ headChannels, showCutoff, customLabels, mode, v
                   const isRowDropTarget = dragOverTarget?.headId === head.id && dragOverTarget.index === subIndex;
                   const isDraggingThis = draggingSub?.subId === sub.id;
                   const isShiftingThis = shiftingSub?.subId === sub.id;
-                  const isSelectedThis = canShiftTime && selectedSub?.subId === sub.id && selectedSub?.headId === head.id;
+                  const isSelectedThis = canShiftTime && selectedSubs.some(entry => entry.subId === sub.id && entry.headId === head.id);
                   const reorderPointerProps = canReorder
                     ? {
                         onPointerDown: (event: PointerEvent) => handlePointerDown(event, head.id, sub.id)
@@ -844,8 +1048,14 @@ function TimelineVisualization({ headChannels, showCutoff, customLabels, mode, v
                             opacity: vs.barOpacity / 100 
                           }}
                           onPointerDown={canShiftTime ? (event) => handleTimeShiftStart(event, head, sub, headDurationMins) : undefined}
-                          onClick={() => {
-                            if (canShiftTime) setSelectedSub({ headId: head.id, subId: sub.id });
+                          onClick={(event) => {
+                            if (!canShiftTime) return;
+                            if (event.ctrlKey || event.metaKey) return;
+                            setSelectedSubs(prev => {
+                              const exists = prev.some(entry => entry.headId === head.id && entry.subId === sub.id);
+                              if (exists && prev.length > 1) return prev;
+                              return [{ headId: head.id, subId: sub.id }];
+                            });
                           }}
                         >
                           {slicedSegments.map(segment => {
@@ -878,6 +1088,7 @@ function TimelineVisualization({ headChannels, showCutoff, customLabels, mode, v
                                     borderRadius: vs.borderRadius,
                                     boxShadow: vs.showShadow ? '0 1px 2px rgba(0,0,0,0.1)' : 'none'
                                   }}
+                                  onContextMenu={(event) => handleSegmentContextMenu(event, head.id, sub.id, segment.intervalId)}
                                 />
                               </CursorTooltip>
                             );
@@ -1031,6 +1242,107 @@ function TimelineVisualization({ headChannels, showCutoff, customLabels, mode, v
           </FullscreenChart>
         );
       })}
+      {contextMenu && (
+        <div
+          className="fixed inset-0 z-50"
+          onClick={() => setContextMenu(null)}
+          onContextMenu={(event) => {
+            event.preventDefault();
+            setContextMenu(null);
+          }}
+        >
+          <div
+            className="absolute min-w-[160px] rounded-md border border-border bg-background shadow-lg p-1 text-xs"
+            style={{ top: contextMenu.y, left: contextMenu.x }}
+            onClick={event => event.stopPropagation()}
+            onContextMenu={event => event.preventDefault()}
+          >
+            <button
+              className="w-full text-left px-2 py-1.5 rounded hover:bg-secondary transition-colors"
+              onClick={() => openIntervalEditor(contextMenu.headId, contextMenu.subId, contextMenu.intervalId)}
+            >
+              Edit Timeline
+            </button>
+          </div>
+        </div>
+      )}
+
+      {editingInterval && (
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm"
+          onClick={() => setEditingInterval(null)}
+        >
+          <div
+            className="bg-background border border-border rounded-2xl shadow-2xl w-full max-w-md m-4 overflow-hidden"
+            onClick={event => event.stopPropagation()}
+          >
+            <div className="flex items-center justify-between px-4 py-3 border-b border-border bg-secondary/30">
+              <div>
+                <h4 className="text-sm font-semibold text-foreground">Edit Timeline</h4>
+                <p className="text-[10px] text-muted-foreground">{editingMeta?.headName} · {editingMeta?.subName}</p>
+              </div>
+              <button
+                className="w-7 h-7 rounded-full bg-muted/80 hover:bg-destructive hover:text-white flex items-center justify-center transition-all"
+                onClick={() => setEditingInterval(null)}
+                aria-label="Close"
+              >
+                <X className="w-3.5 h-3.5" />
+              </button>
+            </div>
+            <div className="p-4 space-y-3">
+              <div className="grid grid-cols-3 gap-2">
+                <div className="space-y-1">
+                  <label className="text-[10px] text-muted-foreground">Start</label>
+                  <input
+                    value={editStartValue}
+                    onChange={event => handleEditStartChange(event.target.value)}
+                    className="w-full px-2 py-1 rounded border border-border bg-background text-xs"
+                    type={mode === 'oclock' ? 'time' : 'number'}
+                    min={0}
+                  />
+                </div>
+                <div className="space-y-1">
+                  <label className="text-[10px] text-muted-foreground">End</label>
+                  <input
+                    value={editEndValue}
+                    onChange={event => handleEditEndChange(event.target.value)}
+                    className="w-full px-2 py-1 rounded border border-border bg-background text-xs"
+                    type={mode === 'oclock' ? 'time' : 'number'}
+                    min={0}
+                  />
+                </div>
+                <div className="space-y-1">
+                  <label className="text-[10px] text-muted-foreground">Duration (min)</label>
+                  <input
+                    value={editDurationValue}
+                    onChange={event => handleEditDurationChange(event.target.value)}
+                    className="w-full px-2 py-1 rounded border border-border bg-background text-xs"
+                    type="number"
+                    min={0}
+                  />
+                </div>
+              </div>
+              <p className="text-[10px] text-muted-foreground">
+                Right-click a segment to edit its timeline.
+              </p>
+            </div>
+            <div className="flex items-center justify-end gap-2 px-4 py-3 border-t border-border bg-secondary/20">
+              <button
+                className="px-3 py-1.5 text-xs rounded-md border border-border bg-background hover:bg-secondary"
+                onClick={() => setEditingInterval(null)}
+              >
+                Cancel
+              </button>
+              <button
+                className="px-3 py-1.5 text-xs rounded-md bg-primary text-primary-foreground hover:bg-primary/90"
+                onClick={applyIntervalEdit}
+              >
+                Save
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
@@ -1065,6 +1377,40 @@ export function ImportTimelineCustomize({ onClose }: ImportTimelineCustomizeProp
   const [showVisualSettings, setShowVisualSettings] = useState(false);
   const [visualSettings, setVisualSettings] = useState<VisualSettings>(DEFAULT_VISUAL_SETTINGS);
   const visualizationRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    const handleKeyDown = (event: KeyboardEvent) => {
+      const isModifier = event.ctrlKey || event.metaKey;
+      if (!isModifier) return;
+      const target = event.target as HTMLElement | null;
+      if (target?.isContentEditable) return;
+      const tag = target?.tagName?.toLowerCase();
+      if (tag === 'input' || tag === 'textarea' || tag === 'select') return;
+
+      const key = event.key.toLowerCase();
+      if (key === 'z') {
+        if (event.shiftKey) {
+          if (redoStack.length === 0) return;
+          event.preventDefault();
+          handleRedo();
+        } else {
+          if (undoStack.length === 0) return;
+          event.preventDefault();
+          handleUndo();
+        }
+        return;
+      }
+
+      if (key === 'y') {
+        if (redoStack.length === 0) return;
+        event.preventDefault();
+        handleRedo();
+      }
+    };
+
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, [handleUndo, handleRedo, undoStack.length, redoStack.length]);
 
   // Mode selection screen
   if (mode === null) {
@@ -1501,7 +1847,7 @@ export function ImportTimelineCustomize({ onClose }: ImportTimelineCustomizeProp
     shiftSessionRef.current = false;
   };
 
-  const handleUndo = () => {
+  function handleUndo() {
     if (undoStack.length === 0) return;
     const nextUndo = [...undoStack];
     const previous = nextUndo.pop();
@@ -1510,9 +1856,9 @@ export function ImportTimelineCustomize({ onClose }: ImportTimelineCustomizeProp
     setUndoStack(nextUndo);
     setRedoStack(prev => [...prev, cloneHeads(headChannels)].slice(-50));
     setHeadChannels(cloneHeads(previous));
-  };
+  }
 
-  const handleRedo = () => {
+  function handleRedo() {
     if (redoStack.length === 0) return;
     const nextRedo = [...redoStack];
     const restored = nextRedo.pop();
@@ -1521,7 +1867,7 @@ export function ImportTimelineCustomize({ onClose }: ImportTimelineCustomizeProp
     setRedoStack(nextRedo);
     setUndoStack(prev => [...prev, cloneHeads(headChannels)].slice(-50));
     setHeadChannels(cloneHeads(restored));
-  };
+  }
 
   const resolveHeadDropIndex = (clientX: number, clientY: number) => {
     if (typeof document === 'undefined') return null;
@@ -2940,16 +3286,17 @@ export function ImportTimelineCustomize({ onClose }: ImportTimelineCustomizeProp
               showCutoff={showCutoffVisual} 
               customLabels={customLabels}
               mode={mode}
-              visibleStatusLabels={visibleStatusLabels}
-              visualSettings={visualSettings}
-              reorderEnabled={reorderSubEnabled}
-              shiftTimeEnabled={shiftTimeEnabled}
-              onMoveSubChannel={moveSubChannel}
-              onShiftSubChannel={shiftSubChannelBy}
-              onShiftSessionStart={beginShiftSession}
-              onShiftSessionEnd={endShiftSession}
-              onOpenSettings={() => setShowVisualSettings(true)}
-            />
+                visibleStatusLabels={visibleStatusLabels}
+                visualSettings={visualSettings}
+                reorderEnabled={reorderSubEnabled}
+                shiftTimeEnabled={shiftTimeEnabled}
+                onMoveSubChannel={moveSubChannel}
+                onShiftSubChannel={shiftSubChannelBy}
+                onUpdateInterval={updateInterval}
+                onShiftSessionStart={beginShiftSession}
+                onShiftSessionEnd={endShiftSession}
+                onOpenSettings={() => setShowVisualSettings(true)}
+              />
           </VisualizationErrorBoundary>
         </div>
       )}
