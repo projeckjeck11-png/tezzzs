@@ -3,12 +3,10 @@ import { useStopwatch } from '@/hooks/useStopwatch';
 import { HeadChannelCard } from '@/components/HeadChannelCard';
 import { ActionBar } from '@/components/ActionBar';
 import { NotesDisplay } from '@/components/NotesDisplay';
-import { ImportTimeline } from '@/components/ImportTimeline';
-import { ImportTimelineOClock } from '@/components/ImportTimelineOClock';
 import { ImportTimelineCustomize } from '@/components/ImportTimelineCustomize';
 import SetupProductionTimeline from '@/components/SetupProductionTimeline';
 import { StopwatchActions } from '@/components/StopwatchActions';
-import { ClipboardPaste, Clock, Plus, Settings2, Factory, ZoomIn, ZoomOut, RotateCcw } from 'lucide-react';
+import { Plus, Settings2, Factory, ZoomIn, ZoomOut, RotateCcw } from 'lucide-react';
 
 export default function Index() {
   const ZOOM_MIN = 0.6;
@@ -21,8 +19,6 @@ export default function Index() {
     return Number.isFinite(parsed) ? parsed : 1;
   });
   const [showZoomControls, setShowZoomControls] = useState(false);
-  const [showImport, setShowImport] = useState(false);
-  const [showImportOClock, setShowImportOClock] = useState(false);
   const [showImportCustomize, setShowImportCustomize] = useState(false);
   const [showSetupProduction, setShowSetupProduction] = useState(false);
   const {
@@ -53,8 +49,6 @@ export default function Index() {
 
   const handleAddHeadChannel = () => {
     addHeadChannel();
-    setShowImport(false);
-    setShowImportOClock(false);
     setShowImportCustomize(false);
     setShowSetupProduction(false);
   };
@@ -155,46 +149,12 @@ export default function Index() {
 
             <button
               className={`flex items-center gap-1.5 py-2.5 px-4 rounded-xl text-sm font-medium transition-all active:scale-[0.98] ${
-                showImport
-                  ? 'bg-primary text-primary-foreground'
-                  : 'bg-secondary text-secondary-foreground border border-dashed border-border hover:bg-accent hover:border-muted-foreground'
-              }`}
-              onClick={() => {
-                setShowImport(!showImport);
-                setShowImportOClock(false);
-                setShowImportCustomize(false);
-              }}
-            >
-              <ClipboardPaste className="w-4 h-4" />
-              Import Timeline
-            </button>
-
-            <button
-              className={`flex items-center gap-1.5 py-2.5 px-4 rounded-xl text-sm font-medium transition-all active:scale-[0.98] ${
-                showImportOClock
-                  ? 'bg-primary text-primary-foreground'
-                  : 'bg-secondary text-secondary-foreground border border-dashed border-border hover:bg-accent hover:border-muted-foreground'
-              }`}
-              onClick={() => {
-                setShowImportOClock(!showImportOClock);
-                setShowImport(false);
-                setShowImportCustomize(false);
-              }}
-            >
-              <Clock className="w-4 h-4" />
-              Import Timeline O'Clock
-            </button>
-
-            <button
-              className={`flex items-center gap-1.5 py-2.5 px-4 rounded-xl text-sm font-medium transition-all active:scale-[0.98] ${
                 showImportCustomize
                   ? 'bg-primary text-primary-foreground'
                   : 'bg-secondary text-secondary-foreground border border-dashed border-border hover:bg-accent hover:border-muted-foreground'
               }`}
               onClick={() => {
                 setShowImportCustomize(!showImportCustomize);
-                setShowImport(false);
-                setShowImportOClock(false);
                 setShowSetupProduction(false);
               }}
             >
@@ -210,8 +170,6 @@ export default function Index() {
               }`}
               onClick={() => {
                 setShowSetupProduction(!showSetupProduction);
-                setShowImport(false);
-                setShowImportOClock(false);
                 setShowImportCustomize(false);
               }}
             >
@@ -227,12 +185,6 @@ export default function Index() {
               onImportChannels={importHeadChannels}
             />
           )}
-
-          {/* Import Timeline Panel */}
-          {showImport && <ImportTimeline onClose={() => setShowImport(false)} />}
-
-          {/* Import Timeline O'Clock Panel */}
-          {showImportOClock && <ImportTimelineOClock onClose={() => setShowImportOClock(false)} />}
 
           {/* Import Timeline Customize Panel */}
           {showImportCustomize && <ImportTimelineCustomize onClose={() => setShowImportCustomize(false)} />}
