@@ -1,5 +1,5 @@
 import { useState, useRef, useEffect, type PointerEvent, type MouseEvent } from 'react';
-import { X, Plus, Trash2, Eye, EyeOff, ChevronDown, ChevronRight, Scissors, FileText, Clock, Save, Upload, Copy, Check, Tag, Settings2, GripVertical } from 'lucide-react';
+import { X, Plus, Trash2, Eye, EyeOff, ChevronDown, ChevronRight, Scissors, FileText, Clock, Save, Upload, Copy, Check, Tag, Settings2, GripVertical, Clipboard } from 'lucide-react';
 import { toast } from 'sonner';
 import { CursorTooltip } from '@/components/CursorTooltip';
 import { saveTextFile, openTextFile } from '@/lib/textFile';
@@ -62,6 +62,8 @@ interface CustomLabel {
   key: string;
   value: string;
   color: string; // badge indicator color
+  scope?: 'global' | 'local';
+  headIds?: string[]; // when scope is local, show only for selected heads
 }
 
 interface ImportTimelineCustomizeProps {
@@ -301,6 +303,7 @@ interface TimelineVisualizationProps {
   visualSettings: VisualSettings;
   reorderEnabled: boolean;
   shiftTimeEnabled: boolean;
+  showRowRulers: boolean;
   onMoveSubChannel?: (fromHeadId: string, subId: string, toHeadId: string, toIndex: number | null) => void;
   onShiftSubChannel?: (headId: string, subId: string, deltaMins: number) => void;
   onUpdateInterval?: (headId: string, subId: string, intervalId: string, updates: Partial<TimelineInterval>) => void;
@@ -311,7 +314,7 @@ interface TimelineVisualizationProps {
   onOpenSettings?: () => void;
 }
 
-function TimelineVisualization({ headChannels, showCutoff, customLabels, mode, visibleStatusLabels, visualSettings, reorderEnabled, shiftTimeEnabled, onMoveSubChannel, onShiftSubChannel, onUpdateInterval, onCopyColorCode, onPasteColorCode, onShiftSessionStart, onShiftSessionEnd, onOpenSettings }: TimelineVisualizationProps) {
+function TimelineVisualization({ headChannels, showCutoff, customLabels, mode, visibleStatusLabels, visualSettings, reorderEnabled, shiftTimeEnabled, showRowRulers, onMoveSubChannel, onShiftSubChannel, onUpdateInterval, onCopyColorCode, onPasteColorCode, onShiftSessionStart, onShiftSessionEnd, onOpenSettings }: TimelineVisualizationProps) {
   const vs = visualSettings;
   const canReorder = reorderEnabled && typeof onMoveSubChannel === 'function';
   const canShiftTime = shiftTimeEnabled && typeof onShiftSubChannel === 'function';
@@ -957,7 +960,7 @@ function TimelineVisualization({ headChannels, showCutoff, customLabels, mode, v
               {/* Timeline Bars */}
               <div style={{ gap: vs.barGap }} className="flex flex-col">
                 {/* Head channel bar (Total) - Always visible */}
-                <div className="flex items-center gap-1">
+                <div className="flex items-center gap-1 relative">
                   <div style={{ width: vs.labelWidth }} className="pr-1 flex-shrink-0 overflow-hidden">
                     <span style={{ fontSize: vs.labelFontSize }} className="font-semibold text-muted-foreground uppercase tracking-wider block truncate text-right">
                       Total
@@ -1050,12 +1053,26 @@ function TimelineVisualization({ headChannels, showCutoff, customLabels, mode, v
                   return (
                     <div
                       key={sub.id}
-                      className={`flex items-center gap-1 ${isRowDropTarget ? 'outline outline-1 outline-emerald-400/70 rounded' : ''} ${isDraggingThis ? 'opacity-60' : ''} ${isSelectedThis ? 'ring-1 ring-sky-400/60 rounded' : ''}`}
+                      className={`flex items-center gap-1 relative ${isRowDropTarget ? 'outline outline-1 outline-emerald-400/70 rounded' : ''} ${isDraggingThis ? 'opacity-60' : ''} ${isSelectedThis ? 'ring-1 ring-sky-400/60 rounded' : ''}`}
                       data-drop-kind="sub"
                       data-drop-head-id={head.id}
                       data-drop-index={subIndex}
                       style={canReorder ? { userSelect: 'none', touchAction: 'none' } : undefined}
                     >
+                      {showRowRulers && (
+                        <div className="absolute inset-0 pointer-events-none" aria-hidden="true">
+                          <div
+                            className="absolute"
+                            style={{ 
+                              left: vs.labelWidth + 4,
+                              right: vs.valueWidth + 4,
+                              top: vs.barHeight / 2,
+                              height: 1,
+                              backgroundColor: 'rgba(0,0,0,0.08)'
+                            }}
+                          />
+                        </div>
+                      )}
                       <div style={{ width: vs.labelWidth }} className="pr-1 flex-shrink-0 overflow-hidden">
                         <div
                           className={`flex items-center justify-end gap-1 ${canReorder ? 'cursor-grab active:cursor-grabbing' : ''}`}
@@ -1241,21 +1258,29 @@ function TimelineVisualization({ headChannels, showCutoff, customLabels, mode, v
               </div>
 
               {/* Custom Labels below graph */}
-              {customLabels.length > 0 && (
-                <div className="flex flex-wrap items-center gap-2 mt-2 pt-1.5 border-t border-border/20">
-                  {customLabels.map(label => (
-                    <div key={label.id} className="flex items-center gap-1 px-2 py-0.5 rounded-full bg-muted/50 border border-border/30">
-                      <div
-                        className="w-1.5 h-1.5 rounded-full"
-                        style={{ backgroundColor: label.color || '#8b5cf6' }}
-                        aria-hidden="true"
-                      />
-                      <span className="text-[8px] font-medium text-muted-foreground">{label.key}:</span>
-                      <span className="text-[8px] font-semibold text-foreground">{label.value}</span>
-                    </div>
-                  ))}
-                </div>
-              )}
+              {(() => {
+                const scopedLabels = customLabels.filter(label => {
+                  const scope = label.scope ?? 'global';
+                  if (scope === 'global') return true;
+                  return (label.headIds ?? []).includes(head.id);
+                });
+                if (scopedLabels.length === 0) return null;
+                return (
+                  <div className="flex flex-wrap items-center gap-2 mt-2 pt-1.5 border-t border-border/20">
+                    {scopedLabels.map(label => (
+                      <div key={label.id} className="flex items-center gap-1 px-2 py-0.5 rounded-full bg-muted/50 border border-border/30">
+                        <div
+                          className="w-1.5 h-1.5 rounded-full"
+                          style={{ backgroundColor: label.color || '#8b5cf6' }}
+                          aria-hidden="true"
+                        />
+                        <span className="text-[8px] font-medium text-muted-foreground">{label.key}:</span>
+                        <span className="text-[8px] font-semibold text-foreground">{label.value}</span>
+                      </div>
+                    ))}
+                  </div>
+                );
+              })()}
 
               {/* Compact Legend */}
               {vs.showLegend && (
@@ -1511,6 +1536,7 @@ export function ImportTimelineCustomize({ onClose }: ImportTimelineCustomizeProp
   const [showVisualSettings, setShowVisualSettings] = useState(false);
   const [visualSettings, setVisualSettings] = useState<VisualSettings>(DEFAULT_VISUAL_SETTINGS);
   const visualizationRef = useRef<HTMLDivElement>(null);
+  const [showRowRulers, setShowRowRulers] = useState(false);
 
   useEffect(() => {
     const handleKeyDown = (event: KeyboardEvent) => {
@@ -1815,15 +1841,25 @@ export function ImportTimelineCustomize({ onClose }: ImportTimelineCustomizeProp
       text += '\n';
     });
 
-    // Custom Labels section
-    if (customLabels.length > 0) {
-      text += 'CUSTOM LABELS\n';
-      text += '+' + '-'.repeat(30) + '+' + '-'.repeat(46) + '+\n';
-      customLabels.forEach(label => {
-        text += '| ' + label.key.padEnd(28) + ' | ' + label.value.padEnd(44) + ' |\n';
-      });
-      text += '+' + '='.repeat(30) + '+' + '='.repeat(46) + '+\n\n';
-    }
+  // Custom Labels section
+  if (customLabels.length > 0) {
+    text += 'CUSTOM LABELS\n';
+    text += '+' + '-'.repeat(18) + '+' + '-'.repeat(16) + '+' + '-'.repeat(46) + '+\n';
+    text += '| ' + 'Scope'.padEnd(16) + ' | ' + 'Key'.padEnd(14) + ' | ' + 'Value'.padEnd(44) + ' |\n';
+    text += '+' + '-'.repeat(18) + '+' + '-'.repeat(16) + '+' + '-'.repeat(46) + '+\n';
+    customLabels.forEach(label => {
+      const scope = label.scope === 'local' ? 'Local' : 'Global';
+      const headNames = label.scope === 'local'
+        ? headChannels
+            .filter(h => (label.headIds ?? []).includes(h.id))
+            .map(h => h.name || 'Head')
+            .join(', ')
+        : '';
+      const scopeText = (scope + (headNames ? ` (${headNames})` : '')).slice(0, 16);
+      text += '| ' + scopeText.padEnd(16) + ' | ' + label.key.padEnd(14) + ' | ' + label.value.padEnd(44) + ' |\n';
+    });
+    text += '+' + '='.repeat(18) + '+' + '='.repeat(16) + '+' + '='.repeat(46) + '+\n\n';
+  }
 
     text += '+' + '='.repeat(W) + '+\n';
     text += '|' + center('END OF REPORT', W) + '|\n';
@@ -2437,6 +2473,8 @@ export function ImportTimelineCustomize({ onClose }: ImportTimelineCustomizeProp
           key: l.key ?? 'Label',
           value: l.value ?? '',
           color: l.color || COLOR_PRESETS[0]?.value || '#8b5cf6',
+          scope: l.scope === 'local' ? 'local' : 'global',
+          headIds: Array.isArray(l.headIds) ? (l.headIds as string[]).filter(Boolean) : [],
         }));
 
         if (incomingLabels.length > 0) {
@@ -2500,7 +2538,10 @@ export function ImportTimelineCustomize({ onClose }: ImportTimelineCustomizeProp
   // Add custom label
   const addCustomLabel = () => {
     const defaultColor = COLOR_PRESETS[customLabels.length % COLOR_PRESETS.length]?.value || '#8b5cf6';
-    setCustomLabels([...customLabels, { id: generateId(), key: 'Label', value: '', color: defaultColor }]);
+    setCustomLabels([
+      ...customLabels,
+      { id: generateId(), key: 'Label', value: '', color: defaultColor, scope: 'global', headIds: [] }
+    ]);
   };
 
   // Update custom label
@@ -2511,6 +2552,18 @@ export function ImportTimelineCustomize({ onClose }: ImportTimelineCustomizeProp
   // Delete custom label
   const deleteCustomLabel = (id: string) => {
     setCustomLabels(customLabels.filter(l => l.id !== id));
+  };
+
+  const toggleLabelHead = (labelId: string, headId: string) => {
+    setCustomLabels(prev =>
+      prev.map(label => {
+        if (label.id !== labelId) return label;
+        const current = Array.isArray(label.headIds) ? [...label.headIds] : [];
+        const exists = current.includes(headId);
+        const nextHeadIds = exists ? current.filter(id => id !== headId) : [...current, headId];
+        return { ...label, headIds: nextHeadIds };
+      })
+    );
   };
 
   const hasData = headChannels.length > 0;
@@ -2590,35 +2643,94 @@ export function ImportTimelineCustomize({ onClose }: ImportTimelineCustomizeProp
             </div>
             <div className="space-y-1.5">
               {customLabels.map(label => (
-                <div key={label.id} className="flex items-center gap-2">
-                  <input
-                    type="color"
-                    value={label.color || '#8b5cf6'}
-                    onChange={(e) => updateCustomLabel(label.id, { color: e.target.value })}
-                    className="w-6 h-6 rounded cursor-pointer border-0 bg-transparent"
-                    title="Label color"
-                  />
-                  <input
-                    type="text"
-                    value={label.key}
-                    onChange={(e) => updateCustomLabel(label.id, { key: e.target.value })}
-                    className="w-24 bg-muted rounded px-2 py-1 text-xs focus:outline-none focus:ring-1 focus:ring-violet-400/50"
-                    placeholder="Key"
-                  />
-                  <span className="text-muted-foreground">:</span>
-                  <input
-                    type="text"
-                    value={label.value}
-                    onChange={(e) => updateCustomLabel(label.id, { value: e.target.value })}
-                    className="flex-1 bg-muted rounded px-2 py-1 text-xs focus:outline-none focus:ring-1 focus:ring-violet-400/50"
-                    placeholder="Value"
-                  />
-                  <button
-                    onClick={() => deleteCustomLabel(label.id)}
-                    className="w-5 h-5 rounded-full hover:bg-destructive/20 hover:text-destructive flex items-center justify-center transition-colors"
-                  >
-                    <X className="w-3 h-3" />
-                  </button>
+                <div key={label.id} className="space-y-1 rounded-md bg-violet-500/5 p-2 border border-violet-500/10">
+                  <div className="flex flex-wrap items-center gap-2">
+                    <div className="flex items-center gap-1">
+                      <input
+                        type="color"
+                        value={label.color || '#8b5cf6'}
+                        onChange={(e) => updateCustomLabel(label.id, { color: e.target.value })}
+                        className="w-7 h-7 rounded cursor-pointer border-0 bg-transparent"
+                        title="Label color"
+                      />
+                      <button
+                        onClick={() => handleCopyColorCode(label.color || '')}
+                        className="px-1.5 py-1 text-[10px] rounded bg-muted text-muted-foreground hover:text-foreground transition-colors"
+                        title="Copy color code"
+                      >
+                        <Copy className="w-3 h-3" />
+                      </button>
+                      <button
+                        onClick={() => handlePasteColorCode((color) => updateCustomLabel(label.id, { color }), label.color)}
+                        className="px-1.5 py-1 text-[10px] rounded bg-muted text-muted-foreground hover:text-foreground transition-colors"
+                        title="Paste color code"
+                      >
+                        <Clipboard className="w-3 h-3" />
+                      </button>
+                    </div>
+
+                    <input
+                      type="text"
+                      value={label.key}
+                      onChange={(e) => updateCustomLabel(label.id, { key: e.target.value })}
+                      className="w-28 bg-muted rounded px-2 py-1 text-xs focus:outline-none focus:ring-1 focus:ring-violet-400/50"
+                      placeholder="Key"
+                    />
+                    <span className="text-muted-foreground">:</span>
+                    <input
+                      type="text"
+                      value={label.value}
+                      onChange={(e) => updateCustomLabel(label.id, { value: e.target.value })}
+                      className="flex-1 min-w-[120px] bg-muted rounded px-2 py-1 text-xs focus:outline-none focus:ring-1 focus:ring-violet-400/50"
+                      placeholder="Value"
+                    />
+
+                    <div className="flex items-center gap-1 text-[10px]">
+                      <span className="text-muted-foreground">Scope</span>
+                      <div className="flex rounded-full border border-border overflow-hidden">
+                        <button
+                          onClick={() => updateCustomLabel(label.id, { scope: 'global', headIds: [] })}
+                          className={`px-2 py-1 ${ (label.scope ?? 'global') === 'global' ? 'bg-violet-500 text-white' : 'text-muted-foreground' } text-[10px] transition-colors`}
+                        >
+                          Global
+                        </button>
+                        <button
+                          onClick={() => updateCustomLabel(label.id, { scope: 'local' })}
+                          className={`px-2 py-1 border-l border-border ${ (label.scope ?? 'global') === 'local' ? 'bg-violet-500 text-white' : 'text-muted-foreground' } text-[10px] transition-colors`}
+                        >
+                          Local
+                        </button>
+                      </div>
+                    </div>
+
+                    <button
+                      onClick={() => deleteCustomLabel(label.id)}
+                      className="w-5 h-5 rounded-full hover:bg-destructive/20 hover:text-destructive flex items-center justify-center transition-colors ml-auto"
+                      title="Delete label"
+                    >
+                      <X className="w-3 h-3" />
+                    </button>
+                  </div>
+
+                  {(label.scope ?? 'global') === 'local' && (
+                    <div className="flex flex-wrap items-center gap-1 pl-1 text-[10px]">
+                      {headChannels.length === 0 && (
+                        <span className="text-muted-foreground">Add a head channel to target this label</span>
+                      )}
+                      {headChannels.map(head => {
+                        const active = (label.headIds ?? []).includes(head.id);
+                        return (
+                          <button
+                            key={head.id}
+                            onClick={() => toggleLabelHead(label.id, head.id)}
+                            className={`px-2 py-1 rounded-full border text-[10px] transition-all ${active ? 'border-violet-500 text-violet-500 bg-violet-500/10' : 'border-border text-muted-foreground hover:text-foreground hover:bg-muted'}`}
+                          >
+                            {head.name}
+                          </button>
+                        );
+                      })}
+                    </div>
+                  )}
                 </div>
               ))}
             </div>
@@ -3358,11 +3470,23 @@ export function ImportTimelineCustomize({ onClose }: ImportTimelineCustomizeProp
                 className={`flex items-center gap-2 px-4 py-2 text-xs font-medium rounded-full transition-all ${
                   shiftTimeEnabled
                     ? 'bg-sky-500/15 text-sky-400 border border-sky-500/30 hover:bg-sky-500/25'
-                    : 'bg-secondary text-muted-foreground border border-border hover:bg-secondary/80'
+                  : 'bg-secondary text-muted-foreground border border-border hover:bg-secondary/80'
                 }`}
                 title="Drag sub head bars left/right to shift time"
               >
                 {shiftTimeEnabled ? 'Shift Time On' : 'Shift Time Off'}
+              </button>
+
+              <button
+                onClick={() => setShowRowRulers(prev => !prev)}
+                className={`flex items-center gap-2 px-4 py-2 text-xs font-medium rounded-full transition-all ${
+                  showRowRulers
+                    ? 'bg-indigo-500/15 text-indigo-500 border border-indigo-500/30 hover:bg-indigo-500/25'
+                    : 'bg-secondary text-muted-foreground border border-border hover:bg-secondary/80'
+                }`}
+                title="Toggle horizontal ruler lines per row"
+              >
+                {showRowRulers ? 'Row Rulers On' : 'Row Rulers Off'}
               </button>
 
               <button
@@ -3411,6 +3535,21 @@ export function ImportTimelineCustomize({ onClose }: ImportTimelineCustomizeProp
                   </>
                 )}
               </button>
+
+              <div className="flex items-center gap-2 px-3 py-2 rounded-full bg-secondary text-muted-foreground border border-border">
+                <span className="text-[10px] font-medium">Label Width</span>
+                <input
+                  type="range"
+                  min="40"
+                  max="200"
+                  step="5"
+                  value={visualSettings.labelWidth}
+                  onChange={(e) => setVisualSettings(prev => ({ ...prev, labelWidth: Number(e.target.value) }))}
+                  className="w-28 accent-indigo-500"
+                  title="Adjust left label column width"
+                />
+                <span className="text-[10px] tabular-nums w-8 text-right">{visualSettings.labelWidth}px</span>
+              </div>
             </div>
           </div>
 
@@ -3424,6 +3563,7 @@ export function ImportTimelineCustomize({ onClose }: ImportTimelineCustomizeProp
                 visualSettings={visualSettings}
                 reorderEnabled={reorderSubEnabled}
                 shiftTimeEnabled={shiftTimeEnabled}
+                showRowRulers={showRowRulers}
                 onMoveSubChannel={moveSubChannel}
                 onShiftSubChannel={shiftSubChannelBy}
                 onUpdateInterval={updateInterval}

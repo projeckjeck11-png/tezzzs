@@ -22,7 +22,19 @@ export function CursorTooltip({
   const [isVisible, setIsVisible] = useState(false);
   const [position, setPosition] = useState({ x: 0, y: 0 });
 
+  const getScale = () => {
+    if (typeof window === 'undefined') return 1;
+    // Prefer appZoom saved by the app; fallback to computed zoom on html
+    const stored = window.localStorage?.getItem('appZoom');
+    const parsed = stored ? Number(stored) : NaN;
+    if (Number.isFinite(parsed) && parsed > 0) return parsed;
+    const computedZoom = parseFloat(getComputedStyle(document.documentElement).zoom || '1');
+    if (Number.isFinite(computedZoom) && computedZoom > 0) return computedZoom;
+    return 1;
+  };
+
   const handleMouseMove = useCallback((e: React.MouseEvent) => {
+    // use viewport coordinates; avoid extra scale math
     setPosition({ x: e.clientX, y: e.clientY });
   }, []);
 
@@ -34,12 +46,22 @@ export function CursorTooltip({
     setIsVisible(false);
   }, []);
 
+  const baseX = position.x;
+  const baseY = position.y;
+  const scale = getScale();
+  const dev = scale - 1;
+  // Piecewise linear correction from user-provided data
+  const dx = dev >= 0 ? dev * -720 : dev * -970;
+  const dy = dev >= 0 ? dev * -260 : dev * -440;
+  const finalX = (baseX + 12 + dx) / scale;
+  const finalY = (baseY - 50 + dy) / scale;
+
   const tooltipElement = isVisible ? (
     <div
       className="fixed z-[9999] pointer-events-none"
       style={{
-        left: position.x + 12,
-        top: position.y - 50,
+        left: finalX,
+        top: finalY,
       }}
     >
       <div className="bg-popover text-popover-foreground px-2.5 py-1.5 rounded-md shadow-lg border border-border text-[10px] whitespace-nowrap">
