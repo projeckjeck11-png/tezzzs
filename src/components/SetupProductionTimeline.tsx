@@ -1795,10 +1795,11 @@ export default function SetupProductionTimeline({ onClose }: SetupProductionTime
       cycleTime: DEFAULT_CYCLE_TIME,
       useIndividualCycleTimes: false,
       kpi: {
-        actualOutput: 0,
-        // Default to per-cycle so per-shift doesn't require an immediate shift-duration setup.
+        cycleTimePerUnit: DEFAULT_CYCLE_TIME,
+        unitsPerCycle: 1,
+        targetEnabled: false,
+        manualTargetOutput: 0,
         targetBasis: 'cycle',
-        targetValue: 1,
         shiftMinutes: undefined,
         actualBasis: 'net',
         timeContext: 'production',
@@ -2130,14 +2131,16 @@ export default function SetupProductionTimeline({ onClose }: SetupProductionTime
         n: p.name,
         ct: p.cycleTime,
         uict: p.useIndividualCycleTimes ? 1 : 0,
-          // KPI tuple: [actualOutput, targetBasis, targetValue, shiftMinutes?, actualBasis?, timeContext?]
+          // KPI tuple: [cycleTimePerUnit, unitsPerCycle, targetBasis, shiftMinutes?, actualBasis?, timeContext?, targetEnabled?, manualTargetOutput?]
           kpi: [
-            p.kpi?.actualOutput ?? 0,
+            p.kpi?.cycleTimePerUnit ?? DEFAULT_CYCLE_TIME,
+            p.kpi?.unitsPerCycle ?? 1,
             p.kpi?.targetBasis ?? 'cycle',
-            p.kpi?.targetValue ?? 1,
             p.kpi?.shiftMinutes ?? null,
             p.kpi?.actualBasis ?? 'net',
             p.kpi?.timeContext ?? 'production',
+            p.kpi?.targetEnabled ? 1 : 0,
+            p.kpi?.manualTargetOutput ?? null,
           ],
         c: p.color,
         h: p.heads.map(h => ({
@@ -2247,12 +2250,14 @@ export default function SetupProductionTimeline({ onClose }: SetupProductionTime
         cycleTime: p.ct || DEFAULT_CYCLE_TIME,
         useIndividualCycleTimes: p.uict === 1,
         kpi: {
-          actualOutput: Array.isArray(p.kpi) ? (Number(p.kpi[0]) || 0) : (Number(p.ao) || 0),
-          targetBasis: Array.isArray(p.kpi) ? (p.kpi[1] || 'cycle') : (p.tb || 'cycle'),
-          targetValue: Array.isArray(p.kpi) ? (Number(p.kpi[2]) || 1) : (Number(p.tv) || 1),
+          cycleTimePerUnit: Array.isArray(p.kpi) ? (Number(p.kpi[0]) || p.ct || DEFAULT_CYCLE_TIME) : (Number(p.ctpu) || p.ct || DEFAULT_CYCLE_TIME),
+          unitsPerCycle: Array.isArray(p.kpi) ? (Number(p.kpi[1]) || 1) : (Number(p.upc) || 1),
+          targetBasis: Array.isArray(p.kpi) ? (p.kpi[2] || 'cycle') : (p.tb || 'cycle'),
           shiftMinutes: Array.isArray(p.kpi) ? (Number(p.kpi[3]) || undefined) : undefined,
           actualBasis: Array.isArray(p.kpi) ? (p.kpi[4] || 'net') : 'net',
           timeContext: Array.isArray(p.kpi) ? (p.kpi[5] || 'production') : 'production',
+          targetEnabled: Array.isArray(p.kpi) ? (!!p.kpi[6]) : false,
+          manualTargetOutput: Array.isArray(p.kpi) ? (Number(p.kpi[7]) || 0) : 0,
         },
         color: p.c || '#10b981',
         expanded: true,
@@ -3709,4 +3714,3 @@ export default function SetupProductionTimeline({ onClose }: SetupProductionTime
     </div>
   );
 }
-

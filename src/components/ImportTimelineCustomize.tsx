@@ -74,6 +74,455 @@ function generateId(): string {
   return `${Date.now()}-${Math.random().toString(36).slice(2, 9)}`;
 }
 
+type SaveExcelResult =
+  | { ok: true }
+  | { ok: false; reason: 'cancelled' | 'unsupported' | 'error'; error?: unknown };
+
+// --- Minimal XLSX builder (no external deps) --- //
+const textEncoder = new TextEncoder();
+
+const crcTable = (() => {
+  const table = new Uint32Array(256);
+  for (let i = 0; i < 256; i++) {
+    let c = i;
+    for (let k = 0; k < 8; k++) {
+      c = (c & 1) ? (0xedb88320 ^ (c >>> 1)) : (c >>> 1);
+    }
+    table[i] = c >>> 0;
+  }
+  return table;
+})();
+
+function crc32(buf: Uint8Array): number {
+  let crc = 0xffffffff;
+  for (let i = 0; i < buf.length; i++) {
+    crc = crcTable[(crc ^ buf[i]) & 0xff] ^ (crc >>> 8);
+  }
+  return (crc ^ 0xffffffff) >>> 0;
+}
+
+function toUtf8(str: string): Uint8Array {
+  return textEncoder.encode(str);
+}
+
+function colName(idx: number): string {
+  let n = idx + 1;
+  let name = '';
+  while (n > 0) {
+    n -= 1;
+    name = String.fromCharCode(65 + (n % 26)) + name;
+    n = Math.floor(n / 26);
+  }
+  return name;
+}
+
+function escapeXml(value: string): string {
+  return value
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;');
+}
+
+function buildSheetXml(rows: (string | number)[][], drawingRelId?: string): string {
+  let xml = '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">';
+  xml += '<sheetData>';
+  rows.forEach((row, rIdx) => {
+    const r = rIdx + 1;
+    xml += `<row r="${r}">`;
+    row.forEach((val, cIdx) => {
+      const cellRef = `${colName(cIdx)}${r}`;
+      if (typeof val === 'number' && Number.isFinite(val)) {
+        xml += `<c r="${cellRef}"><v>${val}</v></c>`;
+      } else {
+        const safe = escapeXml(String(val ?? ''));
+        xml += `<c r="${cellRef}" t="inlineStr"><is><t>${safe}</t></is></c>`;
+      }
+    });
+    xml += '</row>';
+  });
+  xml += '</sheetData>';
+  if (drawingRelId) {
+    xml += `<drawing r:id="${drawingRelId}"/>`;
+  }
+  xml += '</worksheet>';
+  return xml;
+}
+
+interface ZipEntry {
+  name: string;
+  data: Uint8Array;
+}
+
+function buildZip(entries: ZipEntry[]): Uint8Array {
+  const localHeaders: Uint8Array[] = [];
+  const centralHeaders: Uint8Array[] = [];
+  let offset = 0;
+
+  entries.forEach((entry, index) => {
+    const nameBytes = toUtf8(entry.name);
+    const crc = crc32(entry.data);
+    const size = entry.data.length;
+    const lf = new DataView(new ArrayBuffer(30));
+    lf.setUint32(0, 0x04034b50, true);
+    lf.setUint16(4, 20, true); // version needed
+    lf.setUint16(6, 0, true); // flags
+    lf.setUint16(8, 0, true); // compression (store)
+    lf.setUint16(10, 0, true); // mod time
+    lf.setUint16(12, 0, true); // mod date
+    lf.setUint32(14, crc, true);
+    lf.setUint32(18, size, true);
+    lf.setUint32(22, size, true);
+    lf.setUint16(26, nameBytes.length, true);
+    lf.setUint16(28, 0, true); // extra length
+
+    const localHeader = new Uint8Array(30 + nameBytes.length + size);
+    localHeader.set(new Uint8Array(lf.buffer), 0);
+    localHeader.set(nameBytes, 30);
+    localHeader.set(entry.data, 30 + nameBytes.length);
+    localHeaders.push(localHeader);
+
+    const cf = new DataView(new ArrayBuffer(46));
+    cf.setUint32(0, 0x02014b50, true);
+    cf.setUint16(4, 20, true); // version made by
+    cf.setUint16(6, 20, true); // version needed
+    cf.setUint16(8, 0, true); // flags
+    cf.setUint16(10, 0, true); // compression
+    cf.setUint16(12, 0, true); // mod time
+    cf.setUint16(14, 0, true); // mod date
+    cf.setUint32(16, crc, true);
+    cf.setUint32(20, size, true);
+    cf.setUint32(24, size, true);
+    cf.setUint16(28, nameBytes.length, true);
+    cf.setUint16(30, 0, true); // extra
+    cf.setUint16(32, 0, true); // comment
+    cf.setUint16(34, 0, true); // disk start
+    cf.setUint16(36, 0, true); // int attr
+    cf.setUint32(38, 0, true); // ext attr
+    cf.setUint32(42, offset, true);
+
+    const centralHeader = new Uint8Array(46 + nameBytes.length);
+    centralHeader.set(new Uint8Array(cf.buffer), 0);
+    centralHeader.set(nameBytes, 46);
+    centralHeaders.push(centralHeader);
+
+    offset += localHeader.length;
+  });
+
+  const centralSize = centralHeaders.reduce((sum, h) => sum + h.length, 0);
+  const centralOffset = offset;
+  const end = new DataView(new ArrayBuffer(22));
+  end.setUint32(0, 0x06054b50, true);
+  end.setUint16(4, 0, true); // disk
+  end.setUint16(6, 0, true); // start disk
+  end.setUint16(8, entries.length, true);
+  end.setUint16(10, entries.length, true);
+  end.setUint32(12, centralSize, true);
+  end.setUint32(16, centralOffset, true);
+  end.setUint16(20, 0, true); // comment length
+
+  const totalSize = offset + centralSize + 22;
+  const out = new Uint8Array(totalSize);
+  let ptr = 0;
+  localHeaders.forEach(h => {
+    out.set(h, ptr);
+    ptr += h.length;
+  });
+  centralHeaders.forEach(h => {
+    out.set(h, ptr);
+    ptr += h.length;
+  });
+  out.set(new Uint8Array(end.buffer), ptr);
+  return out;
+}
+
+interface ChartSpec {
+  colors: string[]; // per-point hex without '#'
+  categoriesRange: string;
+  startRange: string;
+  durationRange: string;
+  chartId: number;
+  maxVal?: number;
+  legends?: { name: string; color: string }[];
+}
+
+function buildDrawingXml(chartId: number, anchor: { col1: number; row1: number; col2: number; row2: number }): string {
+  return `<?xml version="1.0" encoding="UTF-8"?>
+<xdr:wsDr xmlns:xdr="http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing"
+          xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">
+  <xdr:twoCellAnchor editAs="oneCell">
+    <xdr:from><xdr:col>${anchor.col1}</xdr:col><xdr:colOff>0</xdr:colOff><xdr:row>${anchor.row1}</xdr:row><xdr:rowOff>0</xdr:rowOff></xdr:from>
+    <xdr:to><xdr:col>${anchor.col2}</xdr:col><xdr:colOff>0</xdr:colOff><xdr:row>${anchor.row2}</xdr:row><xdr:rowOff>0</xdr:rowOff></xdr:to>
+    <xdr:graphicFrame macro="">
+      <xdr:nvGraphicFramePr>
+        <xdr:cNvPr id="${chartId}" name="Chart ${chartId}"/>
+        <xdr:cNvGraphicFramePr/>
+      </xdr:nvGraphicFramePr>
+      <xdr:xfrm>
+        <a:off x="0" y="0"/>
+        <a:ext cx="0" cy="0"/>
+      </xdr:xfrm>
+      <a:graphic>
+        <a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/chart">
+          <c:chart xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" r:id="rId1"/>
+        </a:graphicData>
+      </a:graphic>
+    </xdr:graphicFrame>
+    <xdr:clientData/>
+  </xdr:twoCellAnchor>
+</xdr:wsDr>`;
+}
+
+function buildChartXml(spec: ChartSpec): string {
+  const pts = spec.colors
+    .map(
+      (hex, idx) => `<c:dPt><c:idx val="${idx}"/><c:spPr><a:solidFill><a:srgbClr val="${hex}"/></a:solidFill></c:spPr></c:dPt>`
+    )
+    .join('');
+
+  const legendSeries = (spec.legends ?? []).map((leg, i) => {
+    const idx = i + 2; // after start/duration
+    return `
+        <c:ser>
+          <c:idx val="${idx}"/><c:order val="${idx}"/>
+          <c:tx><c:v>${escapeXml(leg.name)}</c:v></c:tx>
+          <c:cat><c:strLit><c:ptCount val="1"/><c:pt idx="0"><c:v>${escapeXml(leg.name)}</c:v></c:pt></c:strLit></c:cat>
+          <c:val><c:numLit><c:ptCount val="1"/><c:pt idx="0"><c:v>0</c:v></c:pt></c:numLit></c:val>
+          <c:spPr><a:solidFill><a:srgbClr val="${leg.color.replace('#','')}"/></a:solidFill></c:spPr>
+          <c:dLbls><c:delete val="1"/></c:dLbls>
+        </c:ser>`;
+  }).join('');
+
+  return `<?xml version="1.0" encoding="UTF-8"?>
+<c:chartSpace xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart"
+              xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"
+              xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
+  <c:chart>
+    <c:autoTitleDeleted val="1"/>
+    <c:plotArea>
+      <c:layout/>
+      <c:barChart>
+        <c:barDir val="bar"/>
+        <c:grouping val="stacked"/>
+        <c:gapWidth val="150"/>
+        <c:ser>
+          <c:idx val="0"/><c:order val="0"/>
+          <c:tx><c:v/></c:tx>
+          <c:cat><c:strRef><c:f>${spec.categoriesRange}</c:f></c:strRef></c:cat>
+          <c:val><c:numRef><c:f>${spec.startRange}</c:f></c:numRef></c:val>
+          <c:spPr><a:noFill/></c:spPr>
+          <c:dLbls>
+            <c:delete val="1"/>
+            <c:showLegendKey val="0"/><c:showVal val="0"/><c:showCatName val="0"/><c:showSerName val="0"/><c:showPercent val="0"/><c:showBubbleSize val="0"/>
+          </c:dLbls>
+        </c:ser>
+        <c:ser>
+          <c:idx val="1"/><c:order val="1"/>
+          <c:tx><c:v/></c:tx>
+          <c:cat><c:strRef><c:f>${spec.categoriesRange}</c:f></c:strRef></c:cat>
+          <c:val><c:numRef><c:f>${spec.durationRange}</c:f></c:numRef></c:val>
+          ${pts}
+          <c:dLbls>
+            <c:delete val="1"/>
+            <c:showLegendKey val="0"/><c:showVal val="0"/><c:showCatName val="0"/><c:showSerName val="0"/><c:showPercent val="0"/><c:showBubbleSize val="0"/>
+          </c:dLbls>
+        </c:ser>
+        ${legendSeries}
+        <c:overlap val="100"/>
+        <c:axId val="1"/><c:axId val="2"/>
+      </c:barChart>
+      <c:catAx>
+        <c:axId val="1"/><c:scaling><c:orientation val="maxMin"/></c:scaling>
+        <c:axPos val="l"/><c:tickLblPos val="nextTo"/><c:crossAx val="2"/><c:crosses val="autoZero"/>
+      </c:catAx>
+      <c:valAx>
+        <c:axId val="2"/><c:scaling><c:orientation val="minMax"/>${spec.maxVal ? `<c:max val="${spec.maxVal}"/>` : ''}</c:scaling>
+        <c:axPos val="b"/><c:tickLblPos val="none"/><c:crossAx val="1"/><c:crosses val="autoZero"/>
+      </c:valAx>
+    </c:plotArea>
+    ${spec.legends && spec.legends.length > 0 ? `
+    <c:legend>
+      <c:legendPos val="b"/><c:layout/>
+      <c:autoGenerateSeries val="0"/>
+      ${spec.legends.map((leg, i) => `
+        <c:legendEntry>
+          <c:idx val="${i + 2}"/>
+          <c:txPr>
+            <a:bodyPr xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"/>
+            <a:lstStyle xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"/>
+            <a:p xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">
+              <a:r><a:t>${escapeXml(leg.name)}</a:t></a:r>
+            </a:p>
+          </c:txPr>
+        </c:legendEntry>`).join('')}
+    </c:legend>` : ''}
+    <c:plotVisOnly val="1"/>
+  </c:chart>
+  <c:printSettings>
+    <c:headerFooter/><c:pageMargins b="0.75" l="0.7" r="0.7" t="0.75" header="0.3" footer="0.3"/><c:pageSetup/>
+  </c:printSettings>
+</c:chartSpace>`;
+}
+
+function buildXlsx(sheets: { name: string; rows: (string | number)[][]; chart?: ChartSpec }[]): Uint8Array {
+  const files: ZipEntry[] = [];
+
+  // Content Types
+  const sheetOverrides = sheets
+    .map((_, idx) => `<Override PartName="/xl/worksheets/sheet${idx + 1}.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>`)
+    .join('');
+  const drawingOverrides = sheets
+    .map((s, idx) => (s.chart ? `<Override PartName="/xl/drawings/drawing${idx + 1}.xml" ContentType="application/vnd.openxmlformats-officedocument.drawing+xml"/>` : ''))
+    .join('');
+  const chartOverrides = sheets
+    .map((s, idx) => (s.chart ? `<Override PartName="/xl/charts/chart${idx + 1}.xml" ContentType="application/vnd.openxmlformats-officedocument.drawingml.chart+xml"/>` : ''))
+    .join('');
+  const contentTypes =
+    `<?xml version="1.0" encoding="UTF-8"?>` +
+    `<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">` +
+    `<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>` +
+    `<Default Extension="xml" ContentType="application/xml"/>` +
+    `<Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>` +
+    sheetOverrides +
+    drawingOverrides +
+    chartOverrides +
+    `</Types>`;
+  files.push({ name: "[Content_Types].xml", data: toUtf8(contentTypes) });
+
+  // _rels/.rels
+  const rels =
+    `<?xml version="1.0" encoding="UTF-8"?>` +
+    `<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">` +
+    `<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/>` +
+    `</Relationships>`;
+  files.push({ name: "_rels/.rels", data: toUtf8(rels) });
+
+  // xl/_rels/workbook.xml.rels
+  const workbookRels =
+    `<?xml version="1.0" encoding="UTF-8"?>` +
+    `<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">` +
+    sheets
+      .map(
+        (_s, idx) =>
+          `<Relationship Id="rId${idx + 1}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet${idx + 1}.xml"/>`
+      )
+      .join('') +
+    `</Relationships>`;
+  files.push({ name: "xl/_rels/workbook.xml.rels", data: toUtf8(workbookRels) });
+
+  // xl/workbook.xml
+  const workbook =
+    `<?xml version="1.0" encoding="UTF-8"?>` +
+    `<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" ` +
+    `xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">` +
+    `<sheets>` +
+    sheets
+      .map((s, idx) => `<sheet name="${escapeXml(s.name)}" sheetId="${idx + 1}" r:id="rId${idx + 1}"/>`)
+      .join('') +
+    `</sheets>` +
+    `</workbook>`;
+  files.push({ name: "xl/workbook.xml", data: toUtf8(workbook) });
+
+  // Sheets (+ optional drawings/charts)
+  sheets.forEach((sheet, idx) => {
+    const sheetId = idx + 1;
+    const drawingRelId = sheet.chart ? 'rId1' : undefined;
+    const xml = buildSheetXml(sheet.rows, drawingRelId);
+    files.push({ name: `xl/worksheets/sheet${sheetId}.xml`, data: toUtf8(xml) });
+
+      if (sheet.chart) {
+        // sheet rels -> drawing
+        const relsXml =
+          `<?xml version="1.0" encoding="UTF-8"?>` +
+          `<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">` +
+          `<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/drawing" Target="../drawings/drawing${sheetId}.xml"/>` +
+          `</Relationships>`;
+        files.push({ name: `xl/worksheets/_rels/sheet${sheetId}.xml.rels`, data: toUtf8(relsXml) });
+
+      // drawing xml (wider & centered for cleaner layout)
+      const drawingXml = buildDrawingXml(sheetId, { col1: 4, row1: 1, col2: 18, row2: sheet.rows.length + 14 });
+        files.push({ name: `xl/drawings/drawing${sheetId}.xml`, data: toUtf8(drawingXml) });
+
+      // drawing rels -> chart
+      const drawingRels =
+        `<?xml version="1.0" encoding="UTF-8"?>` +
+        `<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">` +
+        `<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/chart" Target="../charts/chart${sheetId}.xml"/>` +
+        `</Relationships>`;
+      files.push({ name: `xl/drawings/_rels/drawing${sheetId}.xml.rels`, data: toUtf8(drawingRels) });
+
+      // chart xml
+      const chartXml = buildChartXml(sheet.chart);
+      files.push({ name: `xl/charts/chart${sheetId}.xml`, data: toUtf8(chartXml) });
+    }
+  });
+
+  return buildZip(files);
+}
+
+/**
+ * Save an XLSX payload (zip) via Tauri FS or browser/WebView.
+ */
+async function saveExcelXlsxFile(bytes: Uint8Array, suggestedName: string): Promise<SaveExcelResult> {
+  const tauri = (window as any).__TAURI__;
+  const tauriSave = tauri?.dialog?.save;
+  const tauriWriteFile = tauri?.fs?.writeFile;
+
+  if (tauriSave && tauriWriteFile) {
+    try {
+      let path = await tauriSave({
+        defaultPath: suggestedName,
+        filters: [{ name: 'Excel Workbook', extensions: ['xlsx'] }],
+      });
+      if (!path || Array.isArray(path)) return { ok: false, reason: 'cancelled' };
+      if (!path.toLowerCase().endsWith('.xlsx')) path += '.xlsx';
+      await tauriWriteFile({ path, contents: bytes });
+      return { ok: true };
+    } catch (error) {
+      return { ok: false, reason: 'error', error };
+    }
+  }
+
+  const savePicker = (window as any).showSaveFilePicker as
+    | ((options?: any) => Promise<any>)
+    | undefined;
+  if (savePicker) {
+    try {
+      const handle = await savePicker({
+        suggestedName,
+        types: [
+          {
+            description: 'Excel Workbook',
+            accept: { 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet': ['.xlsx'] },
+          },
+        ],
+      });
+      const writable = await handle.createWritable();
+      await writable.write(new Blob([bytes], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' }));
+      await writable.close();
+      return { ok: true };
+    } catch (error) {
+      if ((error as any)?.name === 'AbortError') return { ok: false, reason: 'cancelled' };
+      return { ok: false, reason: 'error', error };
+    }
+  }
+
+  try {
+    const blob = new Blob([bytes], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = suggestedName;
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+    URL.revokeObjectURL(url);
+    return { ok: true };
+  } catch (error) {
+    return { ok: false, reason: 'error', error };
+  }
+}
+
 // Convert "HH:MM" to minutes from midnight
 function timeToMinutes(time?: string | number | null): number {
   if (typeof time === 'number') return Number.isFinite(time) ? time : 0;
@@ -1870,6 +2319,344 @@ export function ImportTimelineCustomize({ onClose }: ImportTimelineCustomizeProp
     setCopied(false);
   };
 
+  // Export structured timeline data into an Excel-friendly XML (SpreadsheetML) file
+  const exportToExcel = async () => {
+    if (!mode) {
+      toast.error('Pilih mode input terlebih dahulu');
+      return;
+    }
+    if (headChannels.length === 0) {
+      toast.error('No data to export');
+      return;
+    }
+
+    const isOclock = mode === 'oclock';
+
+    const formatPoint = (mins: number) => (isOclock ? minutesToTime(mins) : `${Math.round(mins)}m`);
+    const formatRange = (segments: { start: number; end: number }[]) => {
+      if (segments.length === 0) return '-';
+      return segments
+        .map(seg => `${formatPoint(seg.start)} - ${formatPoint(seg.end)}`)
+        .join('; ');
+    };
+
+    const subtractCutoffs = (
+      intervals: { start: number; end: number }[],
+      cutoffs: { start: number; end: number }[]
+    ) => {
+      const sliced: { start: number; end: number }[] = [];
+      intervals.forEach(interval => {
+        let segments = [{ start: interval.start, end: interval.end }];
+        cutoffs.forEach(cut => {
+          const next: { start: number; end: number }[] = [];
+          segments.forEach(seg => {
+            if (cut.end <= seg.start || cut.start >= seg.end) {
+              next.push(seg);
+            } else {
+              if (cut.start > seg.start) next.push({ start: seg.start, end: cut.start });
+              if (cut.end < seg.end) next.push({ start: cut.end, end: seg.end });
+            }
+          });
+          segments = next;
+        });
+        sliced.push(...segments);
+      });
+      return sliced;
+    };
+
+    const clampSegments = (segments: { start: number; end: number }[], start: number, end: number) =>
+      segments
+        .map(seg => ({ start: Math.max(start, seg.start), end: Math.min(end, seg.end) }))
+        .filter(seg => seg.start < seg.end);
+
+    const normalizeHex = (value?: string | null): string | null => {
+      if (!value || typeof value !== 'string') return null;
+      let v = value.trim().toLowerCase();
+      if (!v.startsWith('#')) v = `#${v}`;
+      if (!/^#[0-9a-f]{3,6}$/.test(v)) return null;
+      if (v.length === 4) {
+        const r = v[1], g = v[2], b = v[3];
+        v = `#${r}${r}${g}${g}${b}${b}`;
+      }
+      return v;
+    };
+
+    const legendFromColors = (colors: (string | null | undefined)[]): string => {
+      const normalized = Array.from(
+        new Set(
+          colors
+            .map(normalizeHex)
+            .filter((c): c is string => Boolean(c))
+        )
+      );
+      if (normalized.length === 0) return '';
+
+      const matches = normalized
+        .map(hex => {
+          const label = customLabels.find(l => normalizeHex(l.color) === hex);
+          return label ? `${label.key}: ${label.value}` : null;
+        })
+        .filter((v): v is string => Boolean(v));
+
+      if (matches.length > 0) {
+        return Array.from(new Set(matches)).join(', ');
+      }
+      // Fallback: show unique hex if no label matches
+      return normalized.join(', ');
+    };
+
+    const headRows: (string | number)[][] = [
+      ['Head #', 'Name', 'Status', 'Mode', 'Start', 'End', 'Total (min)', 'Cutoff (min)', 'Net (min)', 'Legend'],
+    ];
+    const subRows: (string | number)[][] = [
+      [
+        'Head #',
+        'Head Name',
+        'Sub Name',
+        'Status',
+        'Count',
+        'Raw (min)',
+        'Net (min)',
+        'Actual (min)',
+        'Raw Range',
+        'Actual Range',
+        'Legend',
+      ],
+    ];
+    const cutoffRows: (string | number)[][] = [
+      ['Head #', 'Head Name', 'Cutoff Name', 'Start', 'End', 'Duration (min)', 'Legend'],
+    ];
+    const labelRows: (string | number)[][] = [
+      ['Scope', 'Key', 'Value', 'Heads'],
+    ];
+
+    const sheets: { name: string; rows: (string | number)[][]; chart?: ChartSpec }[] = [];
+
+    headChannels.forEach((head, headIdx) => {
+      const cutoffSubs = head.subChannels.filter(s => s.isCutoff);
+      const cutoffIntervals = cutoffSubs.flatMap(c =>
+        c.intervals.map(int => ({ start: int.startMin, end: int.endMin }))
+      );
+      const totalCutoffMins = cutoffIntervals.reduce((acc, c) => acc + (c.end - c.start), 0);
+
+      const headStart = isOclock ? timeToMinutes(head.startTime) : 0;
+      const headEnd = isOclock ? timeToMinutes(head.endTime) : head.totalMinutes;
+      const headDuration = isOclock ? headEnd - headStart : head.totalMinutes;
+      const headNet = Math.max(0, headDuration - totalCutoffMins);
+
+      const subs = head.subChannels.filter(s => !s.isCutoff);
+      const headRangeStart = headStart;
+      const headRangeEnd = headStart + headDuration;
+
+      headRows.push([
+        headIdx + 1,
+        head.name,
+        head.status || '',
+        isOclock ? "O'Clock" : 'Minutes',
+        isOclock ? head.startTime || '-' : '0m',
+        isOclock ? head.endTime || '-' : formatDuration(headDuration),
+        Math.round(headDuration),
+        Math.round(totalCutoffMins),
+        Math.round(headNet),
+        legendFromColors([head.color]),
+      ]);
+
+      const sheetRows: (string | number)[][] = [
+        ['Task', 'Start (min)', 'Duration (min)', 'Legend'],
+      ];
+      const chartColors: string[] = [];
+
+      const labelForColor = (colorHex?: string | null): string | null => {
+        const hex = normalizeHex(colorHex || '');
+        if (!hex) return null;
+        const label = customLabels.find(
+          l =>
+            normalizeHex(l.color) === hex &&
+            (l.scope !== 'local' || (l.headIds ?? []).includes(head.id))
+        );
+        return label ? `${label.key}: ${label.value}` : null;
+      };
+
+      const legendFromColorsWithHead = (colors: (string | null | undefined)[]): string => {
+        for (const c of colors) {
+          const name = labelForColor(c);
+          if (name) return name;
+        }
+        const hex = normalizeHex(colors.find(Boolean) as string | null);
+        return hex ?? '';
+      };
+
+      const addIntervalRow = (taskName: string, startMin: number, endMin: number, legendText: string, colorHex?: string | null) => {
+        const clampedStart = Math.max(headStart, startMin);
+        const clampedEnd = Math.min(headRangeEnd, endMin);
+        const duration = Math.max(0, clampedEnd - clampedStart);
+        const relStart = clampedStart - headStart;
+        if (duration <= 0) return;
+        sheetRows.push([taskName, Math.round(relStart), Math.round(duration), legendText]);
+        const hex = normalizeHex(colorHex || '') || normalizeHex(head.color) || '#10b981';
+        chartColors.push(hex.replace('#', ''));
+      };
+
+      // Total bar at top, colored with head color
+      const totalLegend = legendFromColorsWithHead([head.color]);
+      addIntervalRow('Total', 0, headDuration, totalLegend || 'Total', head.color);
+      // Don't add total to legend
+
+      subs.forEach(sub => {
+        const intervals = sub.intervals.length > 0 ? sub.intervals : [{ startMin: 0, endMin: 0, color: sub.color, id: '', startTime: '', endTime: '' } as any];
+        intervals.forEach((interval, idx) => {
+          const labelText = legendFromColorsWithHead([interval.color, sub.color, head.color]);
+          const colorHex = normalizeHex(interval.color) || normalizeHex(sub.color) || normalizeHex(head.color);
+          const name = intervals.length > 1 ? `${sub.name} (${idx + 1})` : sub.name;
+          addIntervalRow(name, interval.startMin, interval.endMin, labelText, colorHex);
+        });
+
+        // Overview table calculations
+        const rawIntervals = sub.intervals.map(int => ({
+          start: int.startMin,
+          end: int.endMin,
+        }));
+        const rawTotal = rawIntervals.reduce((acc, i) => acc + (i.end - i.start), 0);
+
+        const sliced = subtractCutoffs(rawIntervals, cutoffIntervals);
+        const netTotal = sliced.reduce((acc, s) => acc + (s.end - s.start), 0);
+
+        const clamped = clampSegments(sliced, headRangeStart, headRangeEnd);
+        const mergedActual = mergeIntervals(clamped);
+        const actualTotal = mergedActual.reduce((acc, s) => acc + (s.end - s.start), 0);
+
+        const exceedsHead = rawIntervals.some(seg => seg.start < headRangeStart || seg.end > headRangeEnd);
+        const derivedStatus =
+          sub.status ||
+          (exceedsHead ? 'Overflow' : netTotal < rawTotal ? 'Cut' : 'Full');
+
+        const rawRange = rawIntervals.map(int => `${formatPoint(int.start)} - ${formatPoint(int.end)}`).join('; ');
+        const actualRange = formatRange(mergedActual);
+
+        subRows.push([
+          headIdx + 1,
+          head.name,
+          sub.name,
+          derivedStatus,
+          sub.intervals.length,
+          Math.round(rawTotal),
+          Math.round(netTotal),
+          Math.round(actualTotal),
+          rawRange,
+          actualRange,
+          legendFromColors([
+            ...sub.intervals.map(int => int.color),
+            sub.color,
+            head.color,
+          ]),
+        ]);
+      });
+
+      // Cutoff rows (optional, shown after subs)
+      cutoffSubs.forEach(sub => {
+        sub.intervals.forEach((interval, idx) => {
+          const labelText = legendFromColorsWithHead([interval.color, sub.color, head.color]);
+          const colorHex = normalizeHex(interval.color) || normalizeHex(sub.color) || '#f43f5e';
+          const name = sub.intervals.length > 1 ? `${sub.name} (Cut ${idx + 1})` : `${sub.name} (Cutoff)`;
+          addIntervalRow(name, interval.startMin, interval.endMin, labelText, colorHex);
+
+          cutoffRows.push([
+            headIdx + 1,
+            head.name,
+            name,
+            formatPoint(interval.startMin),
+            formatPoint(interval.endMin),
+            Math.round(interval.endMin - interval.startMin),
+            legendFromColors([interval.color, sub.color, head.color]),
+          ]);
+        });
+      });
+
+      // Build chart spec if we have data rows
+      let chart: ChartSpec | undefined;
+      if (sheetRows.length > 1) {
+        const legendEntries: { name: string; color: string }[] = [];
+        const added = new Set<string>();
+
+        // Include custom labels that apply to this head AND are used by intervals in this head (order as defined in customLabels)
+        customLabels.forEach(label => {
+          const hex = normalizeHex(label.color);
+          if (!hex) return;
+          const allowed = label.scope !== 'local' || (label.headIds ?? []).includes(head.id);
+          if (!allowed) return;
+          // check usage
+          const used = subs.some(sub =>
+            sub.intervals.some(int => normalizeHex(int.color) === hex) ||
+            normalizeHex(sub.color) === hex
+          );
+          if (!used) return;
+          const key = `${label.key}:${label.value}`;
+          if (added.has(key)) return;
+          added.add(key);
+          legendEntries.push({ name: `${label.key}: ${label.value}`, color: hex });
+        });
+
+        const endRow = sheetRows.length;
+        const sheetNameEsc = head.name.replace(/'/g, "''");
+        const catRange = `'${sheetNameEsc}'!$A$2:$A$${endRow}`;
+        const startRange = `'${sheetNameEsc}'!$B$2:$B$${endRow}`;
+        const durRange = `'${sheetNameEsc}'!$C$2:$C$${endRow}`;
+        chart = {
+          colors: chartColors,
+          categoriesRange: catRange,
+          startRange,
+          durationRange: durRange,
+          chartId: headIdx + 1,
+          maxVal: Math.max(headDuration, ...sheetRows.slice(1).map(r => Number(r[1]) + Number(r[2]))),
+          legends: legendEntries,
+        };
+      }
+
+      sheets.push({
+        name: head.name || `Head ${headIdx + 1}`,
+        rows: sheetRows,
+        chart,
+      });
+    });
+
+    // Overview sheets first
+    sheets.unshift(
+      { name: 'Heads', rows: headRows },
+      { name: 'Sub Channels', rows: subRows },
+      ...(cutoffRows.length > 1 ? [{ name: 'Cutoff', rows: cutoffRows }] : [])
+    );
+
+    if (customLabels.length > 0) {
+      customLabels.forEach(label => {
+        const scope = label.scope === 'local' ? 'Local' : 'Global';
+        const headNames =
+          label.scope === 'local'
+            ? headChannels
+                .filter(h => (label.headIds ?? []).includes(h.id))
+                .map(h => h.name || 'Head')
+                .join(', ')
+            : '';
+        labelRows.push([scope, label.key, label.value, headNames]);
+      });
+    }
+
+    if (labelRows.length > 1) sheets.push({ name: 'Labels', rows: labelRows });
+
+    const xlsxBytes = buildXlsx(sheets);
+    const timestamp = new Date();
+    const suggestedName = `timeline-customize-${timestamp.toISOString().replace(/[:]/g, '-').slice(0, 19)}.xlsx`;
+
+    const result = await saveExcelXlsxFile(xlsxBytes, suggestedName);
+    if (result.ok) {
+      toast.success('Excel file saved');
+    } else if (result.reason === 'cancelled') {
+      toast.info('Export dibatalkan');
+    } else {
+      toast.error('Failed to export Excel');
+      console.error(result.error);
+    }
+  };
+
   const copyToClipboard = async () => {
     try {
       await navigator.clipboard.writeText(summaryText);
@@ -3396,6 +4183,14 @@ export function ImportTimelineCustomize({ onClose }: ImportTimelineCustomizeProp
               >
                 <FileText className="w-4 h-4" />
                 Export to Summary
+              </button>
+
+              <button
+                onClick={exportToExcel}
+                className="flex items-center gap-2 px-5 py-2.5 bg-gradient-to-r from-emerald-600 to-emerald-500 text-white rounded-xl text-sm font-medium hover:from-emerald-700 hover:to-emerald-600 transition-all shadow-lg shadow-emerald-500/25"
+              >
+                <Save className="w-4 h-4" />
+                Export to Excel
               </button>
             </>
           )}

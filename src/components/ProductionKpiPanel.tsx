@@ -1,4 +1,4 @@
-import { BarChart, Bar, CartesianGrid, ResponsiveContainer, Tooltip, XAxis, YAxis } from "recharts";
+﻿import { BarChart, Bar, CartesianGrid, ResponsiveContainer, Tooltip, XAxis, YAxis } from "recharts";
 import { useMemo, useRef, useState } from "react";
 
 import {
@@ -21,9 +21,15 @@ type TimeContext = "production" | "production_plus_downtime";
 type TimeUnit = "minutes" | "hours" | "seconds";
 
 export type ProductionKpiConfig = {
-  actualOutput: number;
+  /** Minutes required to produce the given unitsPerCycle (default 210) */
+  cycleTimePerUnit?: number;
+  /** Units produced per cycle (default 1) */
+  unitsPerCycle?: number;
+  /** Enable manual target output entry (default off -> auto) */
+  targetEnabled?: boolean;
+  /** Manual target output when targetEnabled = true */
+  manualTargetOutput?: number;
   targetBasis: TargetBasis;
-  targetValue: number;
   /** Only used when targetBasis === "shift". If missing, per-shift target cannot be computed. */
   shiftMinutes?: number;
   /** Which actual duration to use for KPI math. */
@@ -100,10 +106,11 @@ export function ProductionKpiPanel({
   downtimeBudgetMins,
   timeUnit,
 }: Props) {
-  const actualOutput = clampNumber(config.actualOutput);
-  const targetValue = clampNumber(config.targetValue);
-  const idealOutputPerCycle = clampNumber(config.idealOutputPerCycle ?? 0);
-  const goodOutput = clampNumber(config.goodOutput ?? actualOutput);
+  const cycleTimePerUnit = clampNumber(config.cycleTimePerUnit ?? plannedCycleTimeMins ?? 210);
+  const unitsPerCycle = clampNumber(config.unitsPerCycle ?? 1) || 1;
+  const targetEnabled = config.targetEnabled ?? false;
+  const manualTargetOutput = clampNumber(config.manualTargetOutput ?? 0);
+  const idealOutputPerCycle = clampNumber(config.idealOutputPerCycle ?? unitsPerCycle);
 
   const [shiftDialogOpen, setShiftDialogOpen] = useState(false);
   const [shiftMinutesDraft, setShiftMinutesDraft] = useState<string>("");
@@ -126,10 +133,8 @@ export function ProductionKpiPanel({
   const actualBasis: ActualBasis = config.actualBasis ?? "net";
   const timeContext: TimeContext = config.timeContext ?? "production";
 
-  // PLANNED TIME: Auto-sync with target basis
-  // - per hour/shift: use schedule (total timeline duration)
-  // - per cycle: use cycle time (ideal cycle duration)
-  const plannedTimeMins = config.targetBasis === "cycle" ? plannedCycleTimeMins : plannedScheduleTimeMins;
+  // PLANNED TIME: use scheduled duration (average per head)
+  const plannedTimeMins = plannedScheduleTimeMins;
   const actualTimeMins = actualBasis === "raw" ? actualRawTimeMins : actualNetTimeMins;
 
   const downtimeBudgetCap = clampNumber(downtimeBudgetMins);
@@ -142,22 +147,21 @@ export function ProductionKpiPanel({
     : actualTimeMins;
   const actualHoursForKpi = actualTimeForKpiMins / 60;
   const plannedWindowMins = plannedTimeMins + downtimeBudgetCap;
-  const completedCycles = safeDiv(actualTimeMins, plannedCycleTimeMins);
-  const completedCyclesForKpi = safeDiv(actualTimeForKpiMins, plannedCycleTimeMins);
+  const completedCycles = safeDiv(actualTimeMins, cycleTimePerUnit);
+  const completedCyclesForKpi = safeDiv(actualTimeForKpiMins, cycleTimePerUnit);
+  const actualOutput = completedCyclesForKpi * unitsPerCycle;
+  const targetOutputFromPlan = safeDiv(plannedTimeMins, cycleTimePerUnit) * unitsPerCycle;
   const perHeadOutput = headsCount > 0 ? actualOutput / headsCount : 0;
   const perCycleOutput = completedCyclesForKpi > 0 ? actualOutput / completedCyclesForKpi : 0;
+  const goodOutput = clampNumber(config.goodOutput ?? actualOutput);
 
   const shiftMinutes = clampNumber(config.shiftMinutes ?? 0);
   const completedShifts = shiftMinutes > 0 ? safeDiv(actualTimeForKpiMins, shiftMinutes) : 0;
 
   // CORE CALCULATION: Computed Target
   // This is the expected output based on how much time has passed
-  const computedTargetOutput =
-    config.targetBasis === "shift"
-      ? targetValue * completedShifts
-      : config.targetBasis === "hour"
-        ? targetValue * actualHoursForKpi
-        : targetValue * completedCyclesForKpi;
+  const computedTargetOutput = targetEnabled ? manualTargetOutput : targetOutputFromPlan;
+  const targetValue = computedTargetOutput;
 
   // PRODUCTIVITY: Actual vs Target (simple ratio)
   // Context: If Target = 2 and Actual = 2, productivity = 100%
@@ -171,10 +175,22 @@ export function ProductionKpiPanel({
 
   // 1. AVAILABILITY (Uptime Rate)
   // Planned Production Time includes the configured downtime budget.
-  const downtimePct = safeDiv(downtimeMinsCapped, plannedWindowMins);
-  const availability = plannedWindowMins > 0
-    ? Math.max(0, plannedWindowMins - downtimeMinsCapped) / plannedWindowMins
+  const [oeeView, setOeeView] = useState<"cycle" | "target">("cycle");
+
+  // Base durations: cycle vs target/schedule
+  // Cycle baseline = ideal time for exactly 1 cycle (already includes unitsPerCycle)
+  const plannedBaseMins = cycleTimePerUnit;
+  const plannedWindowMinsBase = plannedBaseMins + downtimeBudgetCap;
+
+  const plannedForView = oeeView === "cycle" ? plannedBaseMins : plannedTimeMins;
+  const plannedWindowMinsView = oeeView === "cycle" ? plannedWindowMinsBase : plannedTimeMins + downtimeBudgetCap;
+
+  const downtimePctBase = safeDiv(downtimeMinsCapped, plannedWindowMinsBase);
+  const downtimePctTarget = safeDiv(downtimeMinsCapped, plannedTimeMins + downtimeBudgetCap);
+  const availabilityBase = plannedWindowMinsBase > 0
+    ? Math.max(0, plannedWindowMinsBase - downtimeMinsCapped) / plannedWindowMinsBase
     : 0;
+
   const netRunningMins = Math.max(0, actualTimeMins);
   const performanceTimeMins = timeContext === "production_plus_downtime"
     ? actualTimeForKpiMins
@@ -185,13 +201,13 @@ export function ProductionKpiPanel({
   // = Actual Running Time / (Planned Time + Actual Downtime)
   // Capped at 100% - if you run longer than planned, utilization is 100%
   // This measures how much of the planned capacity was used
-  const utilizationRaw = safeDiv(netRunningMins, plannedTimeMins + downtimeMinsCapped);
+  const utilizationRaw = safeDiv(netRunningMins, plannedForView + downtimeMinsCapped);
   const utilization = Math.min(utilizationRaw, 1); // Cap at 100%
 
   // 3. TIME EFFICIENCY (Speed)
   // = Planned Time / Actual Time
   // >100% = faster than planned, <100% = slower than planned
-  const timeEfficiency = safeDiv(plannedTimeMins, actualTimeForKpiMins);
+  const timeEfficiency = safeDiv(plannedForView, actualTimeForKpiMins);
 
   // 4. PERFORMANCE RATE (OEE Component)
   // = (Actual Output × Ideal Cycle Time) / Operating Time
@@ -209,7 +225,9 @@ export function ProductionKpiPanel({
 
   // 6. OEE (Overall Equipment Effectiveness)
   // = Availability × Performance × Quality
-  const oee = availability * (performanceRate > 0 ? Math.min(performanceRate, 1) : 1) * qualityRate;
+  const availabilityTarget = plannedWindowMins > 0
+    ? Math.max(0, plannedWindowMins - downtimeMinsCapped) / plannedWindowMins
+    : availabilityBase;
 
   // 7. TAKT TIME ADHERENCE
   // Takt Time = Planned Time / Required Output
@@ -219,12 +237,48 @@ export function ProductionKpiPanel({
   const taktAdherenceRaw = taktTime > 0 ? safeDiv(taktTime, actualCycleTime) : 0;
   const taktAdherence = Math.min(taktAdherenceRaw, 1);
 
+  // =========================================
+  // Dual OEE Baseline (Cycle vs Target)
+  // =========================================
+  // Base Cycle: gunakan cycleTimePerUnit & unitsPerCycle sebagai ideal output acuan.
+  // OEE di sini merefleksikan seberapa baik waktu tersedia dimanfaatkan (Availability * Quality),
+  // dengan asumsi performance ideal (1) saat mengikuti cycle ideal.
+  const oeeCycleBase = availabilityBase * qualityRate;
+
+  // Base Target Output: gunakan target (manual/auto) sebagai output yang harus dicapai.
+  // Performance_target dihitung dari waktu yang diperlukan untuk memenuhi target vs waktu aktual KPI.
+  // Performance vs target output (output-based, capped 100%)
+  const performanceTargetBase = computedTargetOutput > 0
+    ? Math.min(safeDiv(actualOutput, computedTargetOutput), 1)
+    : 0;
+  const oeeTargetBase = availabilityTarget * performanceTargetBase * qualityRate;
+
+  const primaryOee = oeeView === "cycle" ? oeeCycleBase : oeeTargetBase;
+  const primaryLabel = oeeView === "cycle" ? "OEE (Cycle Base)" : "OEE (Target Base)";
+  const performanceDisplay = oeeView === "cycle" ? 1 : performanceTargetBase;
+  const availabilityDisplay = oeeView === "cycle" ? availabilityBase : availabilityTarget;
+  const downtimePctDisplay = oeeView === "cycle" ? downtimePctBase : downtimePctTarget;
+  const plannedDisplay = plannedForView;
+  const plannedWindowDisplay = plannedWindowMinsView;
+  const operatingWindowDisplay = Math.max(0, plannedWindowDisplay - downtimeMinsCapped);
+  const plannedLabel = oeeView === "cycle"
+    ? `Cycle base • ${cycleTimePerUnit}m / ${unitsPerCycle} unit`
+    : "Schedule-based";
+
+  const oeeStatus = (val: number) => {
+    if (!Number.isFinite(val)) return { text: "N/A", cls: "text-muted-foreground" };
+    if (val >= 0.85) return { text: "World Class", cls: "text-green-600" };
+    if (val >= 0.65) return { text: "Typical", cls: "text-amber-600" };
+    return { text: "Needs Improvement", cls: "text-red-600" };
+  };
+
   // Gap calculation
   const outputGap = actualOutput - computedTargetOutput;
   const gapPercentage = computedTargetOutput > 0 ? (outputGap / computedTargetOutput) * 100 : 0;
 
   // Status evaluations
   const productivityStatus = explainProductivityStatus(productivityRatio);
+  const availability = availabilityDisplay;
   const efficiencyStatus = explainEfficiencyStatus(availability);
 
   const chartData = [
@@ -245,9 +299,7 @@ export function ProductionKpiPanel({
 
   // Get planned basis label based on target basis (auto-synced)
   const getPlannedBasisLabel = () => {
-    if (config.targetBasis === "cycle") return "cycle-based";
-    if (config.targetBasis === "shift") return "schedule-based (shift)";
-    return "schedule-based (hour)";
+    return "schedule-based";
   };
 
   return (
@@ -258,6 +310,38 @@ export function ProductionKpiPanel({
           <div className="text-xs font-semibold text-foreground">Productivity & Efficiency</div>
           <div className="text-[10px] text-muted-foreground">
             Planned: {formatTime(plannedTimeMins)} ({getPlannedBasisLabel()}) • Actual ({actualBasis}): {formatTime(actualTimeMins)} • KPI Time: {formatTime(actualTimeForKpiMins)} • Downtime: {formatTime(downtimeMinsCapped)}
+          </div>
+        </div>
+      </div>
+
+      {/* Cycle Time / Unit Settings */}
+      <div className="rounded-lg border border-primary/30 bg-primary/5 p-3 space-y-3">
+        <div className="flex items-center justify-between gap-2 flex-wrap">
+          <div className="text-xs font-semibold text-primary">Cycle Time / Unit</div>
+          <div className="text-[11px] text-muted-foreground">Default 210 menit / 1 unit (bisa diubah)</div>
+        </div>
+        <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+          <div className="space-y-1">
+            <label className="text-[11px] text-muted-foreground">Cycle time (menit per {unitsPerCycle} unit)</label>
+            <input
+              type="number"
+              min={1}
+              step={1}
+              value={cycleTimePerUnit}
+              onChange={(e) => onChange({ cycleTimePerUnit: Number(e.target.value) || 1 })}
+              className="w-full rounded-md border border-border bg-background px-3 py-2 text-sm font-semibold text-foreground focus:border-primary focus:ring-primary"
+            />
+          </div>
+          <div className="space-y-1">
+            <label className="text-[11px] text-muted-foreground">Units per cycle</label>
+            <input
+              type="number"
+              min={0.01}
+              step={0.01}
+              value={unitsPerCycle}
+              onChange={(e) => onChange({ unitsPerCycle: Number(e.target.value) || 1 })}
+              className="w-full rounded-md border border-border bg-background px-3 py-2 text-sm font-semibold text-foreground focus:border-primary focus:ring-primary"
+            />
           </div>
         </div>
       </div>
@@ -339,8 +423,10 @@ export function ProductionKpiPanel({
               <input
                 type="number"
                 min={0}
-                value={Number.isFinite(config.actualOutput) ? config.actualOutput : 0}
-                onChange={(e) => onChange({ actualOutput: Number(e.target.value) || 0 })}
+                step={0.01}
+                value={Number(actualOutput.toFixed(2))}
+                readOnly
+                disabled
                 className="w-full rounded-md border-2 border-green-500/50 bg-green-50/30 dark:bg-green-950/20 px-3 py-2 text-sm font-semibold text-foreground focus:border-green-500 focus:ring-green-500"
               />
               <span className="absolute right-3 top-1/2 -translate-y-1/2 text-xs text-muted-foreground">unit</span>
@@ -352,36 +438,15 @@ export function ProductionKpiPanel({
             <CursorTooltip
               content={
                 <div className="max-w-[340px] whitespace-normal">
-                  <div className="font-medium text-blue-600">Target Output (Target Produksi)</div>
+                  <div className="font-medium text-blue-600">Target Output</div>
                   <div className="text-muted-foreground mt-1">
-                    Jumlah unit yang SEHARUSNYA diproduksi berdasarkan standar/acuan.
+                    Default OFF: otomatis dari planned ÷ cycle time. ON: isi manual (boleh desimal).
                   </div>
                   <div className="mt-2 p-2 bg-muted/30 rounded text-[10px]">
-                    <div className="font-medium">Nilai saat ini: {targetValue} unit {basisLabel(config.targetBasis)}</div>
-                    <div className="mt-2">
-                      <div className="font-medium">Cara Kerja Basis Target:</div>
-                      <div className="mt-1 space-y-1">
-                        <div><span className="font-bold">Per Hour:</span> Target × Jam berjalan</div>
-                        <div><span className="font-bold">Per Cycle:</span> Target × Cycle selesai</div>
-                        <div><span className="font-bold">Per Shift:</span> Target × Shift selesai</div>
-                      </div>
-                    </div>
-                    <div className="mt-2 border-t border-border/50 pt-2">
-                      <div className="font-medium">Computed Target:</div>
-                      <div>
-                        {targetValue} × {
-                          config.targetBasis === "hour" ? `${actualHoursForKpi.toFixed(2)} jam` :
-                          config.targetBasis === "shift" ? `${completedShifts.toFixed(2)} shift` :
-                          `${completedCyclesForKpi.toFixed(2)} cycle`
-                        } = <span className="font-bold text-blue-600">{computedTargetOutput.toFixed(2)} unit</span>
-                      </div>
-                    </div>
-                  </div>
-                  <div className="mt-2">
-                    <div className="font-medium">Contoh:</div>
-                    <div className="text-muted-foreground text-[10px]">
-                      • Target 2 unit/jam, 3 jam berjalan → Target terhitung = 6 unit<br/>
-                      • Target 100 unit/shift, 0.5 shift berjalan → Target terhitung = 50 unit
+                    <div className="font-medium">Target saat ini:</div>
+                    <div className="text-blue-600 font-bold text-lg">{computedTargetOutput.toFixed(2)} unit</div>
+                    <div className="text-muted-foreground mt-1">
+                      {targetEnabled ? "Manual" : "Otomatis"}
                     </div>
                   </div>
                 </div>
@@ -389,102 +454,33 @@ export function ProductionKpiPanel({
             >
               <label className="text-[10px] font-medium text-blue-600 cursor-help flex items-center gap-1">
                 <span className="w-2 h-2 rounded-full bg-blue-500"></span>
-                Target Output (standar produksi)
+                Target Output
               </label>
             </CursorTooltip>
-            <div className="flex gap-2">
+            <div className="flex gap-2 items-center">
+              <label className="flex items-center gap-2 text-xs text-muted-foreground">
+                <input
+                  type="checkbox"
+                  checked={targetEnabled}
+                  onChange={(e) => onChange({ targetEnabled: e.target.checked })}
+                  className="h-4 w-4 rounded border-border bg-background"
+                />
+                Manual target
+              </label>
               <div className="relative flex-1">
                 <input
                   type="number"
                   min={0}
-                  value={Number.isFinite(config.targetValue) ? config.targetValue : 0}
-                  onChange={(e) => onChange({ targetValue: Number(e.target.value) || 0 })}
-                  className="w-full rounded-md border-2 border-blue-500/50 bg-blue-50/30 dark:bg-blue-950/20 px-3 py-2 text-sm font-semibold text-foreground focus:border-blue-500 focus:ring-blue-500"
+                  step={0.01}
+                  value={targetEnabled ? manualTargetOutput : computedTargetOutput}
+                  onChange={(e) => onChange({ manualTargetOutput: Number(e.target.value) || 0, targetEnabled: true })}
+                  disabled={!targetEnabled}
+                  className="w-full rounded-md border-2 px-3 py-2 text-sm font-semibold text-foreground focus:ring-blue-500 border-blue-500/50 bg-blue-50/30 dark:bg-blue-950/20 focus:border-blue-500 disabled:border-border disabled:bg-muted/40 disabled:text-muted-foreground disabled:cursor-not-allowed"
                 />
                 <span className="absolute right-3 top-1/2 -translate-y-1/2 text-xs text-muted-foreground">unit</span>
               </div>
-              <CursorTooltip
-                content={
-                  <div className="max-w-[340px] whitespace-normal">
-                    <div className="font-medium text-primary">Basis Target: {basisLabel(config.targetBasis).toUpperCase()}</div>
-                    <div className="text-muted-foreground mt-1">
-                      Menentukan bagaimana target dikalkulasi berdasarkan waktu.
-                    </div>
-                    <div className="mt-2 p-2 bg-muted/30 rounded text-[10px]">
-                      <div className="font-medium">Pilihan Basis:</div>
-                      <div className="mt-1 space-y-2">
-                        <div>
-                          <span className="font-bold">Per Hour:</span><br/>
-                          Target × (KPI Time ÷ 60)<br/>
-                          <span className="text-muted-foreground">Contoh: 10 unit/jam × 2 jam = 20 unit target</span>
-                        </div>
-                        <div>
-                          <span className="font-bold">Per Cycle:</span><br/>
-                          Target × (KPI Time ÷ Planned Time)<br/>
-                          <span className="text-muted-foreground">Contoh: 50 unit/cycle × 1.5 cycle = 75 unit target</span>
-                        </div>
-                        <div>
-                          <span className="font-bold">Per Shift:</span><br/>
-                          Target × (KPI Time ÷ Shift Duration)<br/>
-                          <span className="text-muted-foreground">Contoh: 200 unit/shift × 0.8 shift = 160 unit target</span>
-                        </div>
-                      </div>
-                    </div>
-                    <div className="mt-2 p-2 bg-amber-500/10 rounded text-[10px]">
-                      <div className="font-medium text-amber-600">⚡ Auto-Sync Planned Time:</div>
-                      <div className="text-muted-foreground mt-1">
-                        Planned time akan otomatis menyesuaikan dengan basis yang dipilih:
-                        <br/>• Per Hour/Shift → Schedule-based
-                        <br/>• Per Cycle → Cycle-based
-                      </div>
-                    </div>
-                  </div>
-                }
-              >
-                <select
-                  value={config.targetBasis}
-                  onChange={(e) => {
-                    const next = e.target.value as TargetBasis;
-                    const prev = config.targetBasis;
-                    prevBasisRef.current = prev;
-
-                    if (next === "shift" && !(config.shiftMinutes && config.shiftMinutes > 0)) {
-                      setShiftMinutesDraft("");
-                      shiftSavedRef.current = false;
-                      setShiftDialogOpen(true);
-                      return;
-                    }
-
-                    onChange({ targetBasis: next });
-                  }}
-                  className="rounded-md border-2 border-blue-500/50 bg-blue-50/30 dark:bg-blue-950/20 px-2 py-2 text-xs font-medium text-foreground cursor-help"
-                >
-                  <option value="hour">per hour</option>
-                  <option value="cycle">per cycle</option>
-                  <option value="shift">per shift</option>
-                </select>
-              </CursorTooltip>
             </div>
-            
-            {/* Shift Duration Edit Button */}
-            {config.targetBasis === "shift" && (
-              <div className="flex items-center gap-2 mt-1">
-                <span className="text-[10px] text-muted-foreground">
-                  Shift: {shiftMinutes > 0 ? `${shiftMinutes} menit (${(shiftMinutes / 60).toFixed(1)} jam)` : "belum diatur"}
-                </span>
-                <button
-                  onClick={() => {
-                    setShiftMinutesDraft(shiftMinutes > 0 ? String(shiftMinutes) : "");
-                    prevBasisRef.current = "shift";
-                    shiftSavedRef.current = false;
-                    setShiftDialogOpen(true);
-                  }}
-                  className="text-[10px] text-primary hover:underline"
-                >
-                  {shiftMinutes > 0 ? "Edit" : "Set"}
-                </button>
-              </div>
-            )}
+            {/* Shift Duration Edit Button removed (auto mode) */}
           </div>
         </div>
 
@@ -658,6 +654,26 @@ export function ProductionKpiPanel({
             </select>
           </div>
         </CursorTooltip>
+
+        <div className="flex items-center gap-2 text-[10px]">
+          <span className="text-muted-foreground">OEE Base:</span>
+          <div className="inline-flex rounded-md border border-border bg-muted/50 overflow-hidden">
+            <button
+              className={`px-3 py-1 font-medium ${oeeView === "cycle" ? "bg-primary text-primary-foreground" : "text-muted-foreground"}`}
+              onClick={() => setOeeView("cycle")}
+              type="button"
+            >
+              Cycle
+            </button>
+            <button
+              className={`px-3 py-1 font-medium ${oeeView === "target" ? "bg-primary text-primary-foreground" : "text-muted-foreground"}`}
+              onClick={() => setOeeView("target")}
+              type="button"
+            >
+              Target
+            </button>
+          </div>
+        </div>
       </div>
 
       {/* MAIN CONTENT GRID */}
@@ -708,11 +724,11 @@ export function ProductionKpiPanel({
                   <div className="mt-2">
                     <div className="font-medium">Interpretasi Nilai {pct(productivityRatio)}:</div>
                     <div className="text-muted-foreground space-y-1 mt-1">
-                      {productivityRatio >= 1.2 && <div className="text-green-600">🎯 SANGAT PRODUKTIF! Melebihi target sebesar {((productivityRatio - 1) * 100).toFixed(0)}%.</div>}
+                      {productivityRatio >= 1.2 && <div className="text-green-600">🏆 SANGAT PRODUKTIF! Melebihi target sebesar {((productivityRatio - 1) * 100).toFixed(0)}%.</div>}
                       {productivityRatio >= 1.0 && productivityRatio < 1.2 && <div className="text-green-500">✅ PRODUKTIF. Target tercapai atau terlampaui.</div>}
                       {productivityRatio >= 0.8 && productivityRatio < 1.0 && <div className="text-amber-500">📊 CUKUP PRODUKTIF. Kurang {((1 - productivityRatio) * 100).toFixed(0)}% dari target.</div>}
                       {productivityRatio >= 0.5 && productivityRatio < 0.8 && <div className="text-orange-500">⚠️ KURANG PRODUKTIF. Hanya {(productivityRatio * 100).toFixed(0)}% dari target tercapai.</div>}
-                      {productivityRatio > 0 && productivityRatio < 0.5 && <div className="text-red-600">🔴 KRITIS! Hanya {(productivityRatio * 100).toFixed(0)}% dari target. Perlu evaluasi segera.</div>}
+                      {productivityRatio > 0 && productivityRatio < 0.5 && <div className="text-red-600">🚨 KRITIS! Hanya {(productivityRatio * 100).toFixed(0)}% dari target. Perlu evaluasi segera.</div>}
                       {productivityRatio === 0 && <div className="text-muted-foreground">⚠️ Tidak ada data. Isi Actual Output dan Target.</div>}
                     </div>
                   </div>
@@ -780,7 +796,7 @@ export function ProductionKpiPanel({
                       )}
                       {outputGap <= -computedTargetOutput * 0.25 && computedTargetOutput > 0 && (
                         <div className="text-red-600">
-                          🔴 KURANG {Math.abs(outputGap).toFixed(2)} unit ({Math.abs(gapPercentage).toFixed(1)}% di bawah target).<br/>
+                          🚨 KURANG {Math.abs(outputGap).toFixed(2)} unit ({Math.abs(gapPercentage).toFixed(1)}% di bawah target).<br/>
                           Artinya: Jauh di bawah target! Investigasi diperlukan.
                         </div>
                       )}
@@ -808,7 +824,7 @@ export function ProductionKpiPanel({
 
           {/* REPORT: Kesimpulan Productivity */}
           <div className={`mt-3 p-3 rounded-lg border ${productivityRatio >= 1 ? 'bg-green-50/50 dark:bg-green-950/20 border-green-200 dark:border-green-800' : productivityRatio >= 0.8 ? 'bg-amber-50/50 dark:bg-amber-950/20 border-amber-200 dark:border-amber-800' : 'bg-red-50/50 dark:bg-red-950/20 border-red-200 dark:border-red-800'}`}>
-            <div className="text-[10px] font-semibold text-muted-foreground mb-1">📋 Kesimpulan Productivity</div>
+            <div className="text-[10px] font-semibold text-muted-foreground mb-1">📝 Kesimpulan Productivity</div>
             <div className="text-xs text-foreground space-y-1">
               {productivityRatio === 0 || !Number.isFinite(productivityRatio) ? (
                 <p>⚠️ Belum ada data untuk dianalisis. Isi Actual Output dan Target terlebih dahulu.</p>
@@ -819,11 +835,11 @@ export function ProductionKpiPanel({
                     produksi aktual adalah <span className="font-bold text-green-600">{actualOutput} unit</span>.
                   </p>
                   <p className={productivityStatus.color}>
-                    {productivityRatio >= 1.2 && `🎯 Performa SANGAT BAIK! Melebihi target sebesar ${((productivityRatio - 1) * 100).toFixed(0)}%. Pertahankan momentum ini.`}
+                    {productivityRatio >= 1.2 && `🏆 Performa SANGAT BAIK! Melebihi target sebesar ${((productivityRatio - 1) * 100).toFixed(0)}%. Pertahankan momentum ini.`}
                     {productivityRatio >= 1.0 && productivityRatio < 1.2 && `✅ Performa BAIK. Target tercapai. ${outputGap > 0 ? `Surplus ${outputGap.toFixed(2)} unit.` : ''}`}
                     {productivityRatio >= 0.8 && productivityRatio < 1.0 && `📊 Performa CUKUP. Kurang ${Math.abs(outputGap).toFixed(2)} unit dari target. Identifikasi hambatan produksi.`}
                     {productivityRatio >= 0.5 && productivityRatio < 0.8 && `⚠️ Performa KURANG. Hanya ${(productivityRatio * 100).toFixed(0)}% dari target. Perlu evaluasi proses dan resources.`}
-                    {productivityRatio < 0.5 && `🔴 Performa KRITIS. Hanya ${(productivityRatio * 100).toFixed(0)}% dari target. Segera lakukan root cause analysis.`}
+                    {productivityRatio < 0.5 && `🚨 Performa KRITIS. Hanya ${(productivityRatio * 100).toFixed(0)}% dari target. Segera lakukan root cause analysis.`}
                   </p>
                 </>
               )}
@@ -911,12 +927,13 @@ export function ProductionKpiPanel({
                       Persentase waktu yang digunakan untuk produksi (bukan downtime).
                     </div>
                     <div className="mt-2 p-2 bg-muted/30 rounded text-[10px]">
-                      <div className="font-medium">Rumus:</div>
-                      <div className="font-mono">100% - (Downtime ÷ (Planned + Budget) × 100%)</div>
-                      <div className="mt-2 border-t border-border/50 pt-2">
-                        <div>Downtime% = {formatTime(downtimeMinsCapped)} ÷ ({formatTime(plannedTimeMins)} + {formatTime(downtimeBudgetCap)}) = {pct(downtimePct)}</div>
-                        <div>Availability = 100% - {pct(downtimePct)} = <span className="font-bold">{pct(availability)}</span></div>
-                      </div>
+                    <div className="font-medium">Rumus:</div>
+                    <div className="font-mono">100% - (Downtime ÷ (Planned + Budget) × 100%)</div>
+                    <div className="mt-2 border-t border-border/50 pt-2">
+                      <div><span className="font-semibold">{plannedLabel}</span></div>
+                      <div>Downtime% = {formatTime(downtimeMinsCapped)} ÷ ({formatTime(plannedDisplay)} + {formatTime(downtimeBudgetCap)}) = {pct(downtimePctDisplay)}</div>
+                      <div>Availability = 100% - {pct(downtimePctDisplay)} = <span className="font-bold">{pct(availability)}</span></div>
+                    </div>
                     </div>
                     <div className="mt-2">
                       <div className="font-medium">Interpretasi {pct(availability)}:</div>
@@ -947,7 +964,8 @@ export function ProductionKpiPanel({
                       <div className="font-mono">min(Actual ÷ (Planned + Downtime), 100%)</div>
                       <div className="mt-2 border-t border-border/50 pt-2">
                         <div>Net Running = {formatTime(actualTimeMins)} (downtime di luar actual)</div>
-                        <div>Raw = {formatTime(netRunningMins)} ÷ ({formatTime(plannedTimeMins)} + {formatTime(downtimeMinsCapped)}) = {pct(utilizationRaw)}</div>
+                        <div><span className="font-semibold">{plannedLabel}</span></div>
+                        <div>Raw = {formatTime(netRunningMins)} ÷ ({formatTime(plannedDisplay)} + {formatTime(downtimeMinsCapped)}) = {pct(utilizationRaw)}</div>
                         <div>Capped = <span className="font-bold">{pct(utilization)}</span></div>
                       </div>
                     </div>
@@ -986,7 +1004,8 @@ export function ProductionKpiPanel({
                       <div className="font-medium">Rumus:</div>
                       <div className="font-mono">(Planned ÷ Actual) × 100%</div>
                       <div className="mt-2 border-t border-border/50 pt-2">
-                        <div>= {formatTime(plannedTimeMins)} ÷ {formatTime(actualTimeForKpiMins)}</div>
+                        <div><span className="font-semibold">{plannedLabel}</span></div>
+                        <div>= {formatTime(plannedDisplay)} ÷ {formatTime(actualTimeForKpiMins)}</div>
                         <div>= <span className="font-bold">{pct(timeEfficiency)}</span></div>
                       </div>
                     </div>
@@ -1011,43 +1030,29 @@ export function ProductionKpiPanel({
 
           {/* Industry Standard Metrics - OEE Components */}
           <div>
-            <div className="text-[10px] font-medium text-muted-foreground mb-2">Industry Metrics (OEE Components)</div>
-            <div className="grid grid-cols-2 gap-2 text-xs">
-              <CursorTooltip
-                content={
-                  <div className="max-w-[360px] whitespace-normal">
-                    <div className="font-medium text-primary">OEE (Overall Equipment Effectiveness)</div>
-                    <div className="text-muted-foreground mt-1">
-                      Standar industri untuk mengukur efektivitas peralatan secara keseluruhan.
-                    </div>
-                    <div className="mt-2 p-2 bg-muted/30 rounded text-[10px]">
-                      <div className="font-medium">Rumus:</div>
-                      <div className="font-mono">Availability × Performance × Quality</div>
-                      <div className="mt-2 border-t border-border/50 pt-2">
-                        <div>= {pct(availability)} × {pct(Math.min(performanceRate, 1))} × {pct(qualityRate)}</div>
-                        <div>= <span className="font-bold">{pct(oee)}</span></div>
-                      </div>
-                    </div>
-                    <div className="mt-2">
-                      <div className="font-medium">Benchmark OEE:</div>
-                      <div className="text-[10px] space-y-0.5 mt-1">
-                        <div><span className="text-green-600">≥85%</span> = World Class</div>
-                        <div><span className="text-green-500">65-84%</span> = Typical</div>
-                        <div><span className="text-amber-500">40-64%</span> = Low (perlu improvement)</div>
-                        <div><span className="text-red-600">&lt;40%</span> = Very Low (urgent action)</div>
-                      </div>
-                    </div>
+          <div className="text-[10px] font-medium text-muted-foreground mb-2">Industry Metrics (OEE Components)</div>
+          <div className="grid grid-cols-2 gap-2 text-xs">
+            <CursorTooltip
+              content={
+                <div className="max-w-[360px] whitespace-normal">
+                  <div className="font-medium text-primary">{primaryLabel}</div>
+                  <div className="text-muted-foreground mt-1">
+                    Cycle Base: Availability × Quality (performance diasumsikan ideal).<br/>
+                    Target Base: Availability × Performance_target × Quality, dengan performance_target = waktu ideal untuk target ÷ KPI time.
                   </div>
-                }
-              >
-                <div className={`rounded-md p-2 cursor-help ${oee >= 0.85 ? 'bg-green-500/10 border border-green-500/20' : oee >= 0.65 ? 'bg-amber-500/10 border border-amber-500/20' : 'bg-red-500/10 border border-red-500/20'}`}>
-                  <div className="text-[10px] text-muted-foreground">OEE</div>
-                  <div className="font-bold text-lg tabular-nums">{pct(oee)}</div>
-                  <div className="text-[9px] text-muted-foreground">
-                    {oee >= 0.85 ? 'World Class' : oee >= 0.65 ? 'Typical' : 'Needs Improvement'}
+                  <div className="mt-2 p-2 bg-muted/30 rounded text-[10px]">
+                    <div className="font-medium">Nilai:</div>
+                    <div className="font-mono text-lg">{pct(primaryOee)}</div>
                   </div>
                 </div>
-              </CursorTooltip>
+              }
+            >
+              <div className={`rounded-md p-2 cursor-help ${primaryOee >= 0.85 ? 'bg-green-500/10 border border-green-500/20' : primaryOee >= 0.65 ? 'bg-amber-500/10 border border-amber-500/20' : 'bg-red-500/10 border border-red-500/20'}`}>
+                <div className="text-[10px] text-muted-foreground">{primaryLabel}</div>
+                <div className="font-bold text-lg tabular-nums">{pct(primaryOee)}</div>
+                <div className={`text-[9px] ${oeeStatus(primaryOee).cls}`}>{oeeStatus(primaryOee).text}</div>
+              </div>
+            </CursorTooltip>
 
               <CursorTooltip
                 content={
@@ -1086,8 +1091,8 @@ export function ProductionKpiPanel({
             </div>
 
             {/* OEE Component Breakdown */}
-            <div className="grid grid-cols-3 gap-2 text-xs mt-2">
-              <CursorTooltip
+          <div className="grid grid-cols-3 gap-2 text-xs mt-2">
+            <CursorTooltip
                 content={
                   <div className="max-w-[300px] whitespace-normal">
                     <div className="font-medium">Availability (OEE A)</div>
@@ -1095,14 +1100,15 @@ export function ProductionKpiPanel({
                       Komponen pertama OEE: waktu uptime vs total waktu.
                     </div>
                     <div className="mt-2 p-2 bg-muted/30 rounded text-[10px]">
+                      <div><span className="font-semibold">{plannedLabel}</span></div>
                       <div>= (Planned + Budget - Downtime) ÷ (Planned + Budget)</div>
                       <div>= {pct(availability)}</div>
                       <div className="mt-2 border-t border-border/50 pt-2">
-                        <div>Planned = {formatTime(plannedTimeMins)}</div>
+                        <div>Planned = {formatTime(plannedDisplay)}</div>
                         <div>Budget = {formatTime(downtimeBudgetCap)}</div>
                         <div>Downtime = {formatTime(downtimeMinsCapped)}</div>
-                        <div>Operating = {formatTime(Math.max(0, plannedWindowMins - downtimeMinsCapped))}</div>
-                        <div>A = {formatTime(Math.max(0, plannedWindowMins - downtimeMinsCapped))} / {formatTime(plannedWindowMins)} = {pct(availability)}</div>
+                        <div>Operating = {formatTime(operatingWindowDisplay)}</div>
+                        <div>A = {formatTime(operatingWindowDisplay)} / {formatTime(plannedWindowDisplay)} = {pct(availability)}</div>
                       </div>
                     </div>
                   </div>
@@ -1110,7 +1116,7 @@ export function ProductionKpiPanel({
               >
                 <div className="rounded-md bg-muted/20 p-1.5 cursor-help text-center">
                   <div className="text-[9px] text-muted-foreground">A</div>
-                  <div className="font-semibold text-[11px] tabular-nums">{pct(availability)}</div>
+                  <div className="font-semibold text-[11px] tabular-nums">{pct(availabilityDisplay)}</div>
                 </div>
               </CursorTooltip>
 
@@ -1152,7 +1158,7 @@ export function ProductionKpiPanel({
               >
                 <div className="rounded-md bg-muted/20 p-1.5 cursor-help text-center">
                   <div className="text-[9px] text-muted-foreground">P</div>
-                  <div className="font-semibold text-[11px] tabular-nums">{pct(Math.min(performanceRate, 1))}</div>
+                  <div className="font-semibold text-[11px] tabular-nums">{pct(Math.min(performanceDisplay, 1))}</div>
                 </div>
               </CursorTooltip>
 
@@ -1193,23 +1199,23 @@ export function ProductionKpiPanel({
           </div>
 
           {/* REPORT: Kesimpulan Efficiency */}
-          <div className={`p-3 rounded-lg border ${oee >= 0.85 ? 'bg-green-50/50 dark:bg-green-950/20 border-green-200 dark:border-green-800' : oee >= 0.65 ? 'bg-amber-50/50 dark:bg-amber-950/20 border-amber-200 dark:border-amber-800' : 'bg-red-50/50 dark:bg-red-950/20 border-red-200 dark:border-red-800'}`}>
-            <div className="text-[10px] font-semibold text-muted-foreground mb-1">📋 Kesimpulan Efficiency</div>
+          <div className={`p-3 rounded-lg border ${primaryOee >= 0.85 ? 'bg-green-50/50 dark:bg-green-950/20 border-green-200 dark:border-green-800' : primaryOee >= 0.65 ? 'bg-amber-50/50 dark:bg-amber-950/20 border-amber-200 dark:border-amber-800' : 'bg-red-50/50 dark:bg-red-950/20 border-red-200 dark:border-red-800'}`}>
+            <div className="text-[10px] font-semibold text-muted-foreground mb-1">📝 Kesimpulan Efficiency</div>
             <div className="text-xs text-foreground space-y-1">
               {actualTimeMins === 0 ? (
                 <p>⚠️ Belum ada data waktu untuk dianalisis.</p>
               ) : (
                 <>
                   <p>
-                    OEE: <span className="font-bold">{pct(oee)}</span> • 
-                    Availability: <span className={downtimePct > 0.1 ? 'font-bold text-red-600' : 'font-bold'}>{pct(availability)}</span> • 
+                    {primaryLabel}: <span className="font-bold">{pct(primaryOee)}</span> • 
+                    Availability: <span className={downtimePctDisplay > 0.1 ? 'font-bold text-red-600' : 'font-bold'}>{pct(availability)}</span> • 
                     Utilization: <span className="font-bold">{pct(utilization)}</span>
                   </p>
                   <p className={efficiencyStatus.color}>
-                    {oee >= 0.85 && `🎯 WORLD CLASS! OEE ${pct(oee)} menunjukkan operasi sangat efisien. Pertahankan!`}
-                    {oee >= 0.65 && oee < 0.85 && `✅ TYPICAL. OEE ${pct(oee)} dalam range normal. Ada ruang untuk improvement.`}
-                    {oee >= 0.4 && oee < 0.65 && `📊 PERLU PERHATIAN. OEE ${pct(oee)} di bawah rata-rata. Fokus pada ${availability < 0.85 ? 'downtime reduction' : performanceRate < 0.85 ? 'speed optimization' : 'quality improvement'}.`}
-                    {oee < 0.4 && `⚠️ URGENT! OEE sangat rendah. Perlu investigasi menyeluruh pada Availability, Performance, dan Quality.`}
+                    {primaryOee >= 0.85 && `🏆 WORLD CLASS! ${primaryLabel} ${pct(primaryOee)} menunjukkan operasi sangat efisien. Pertahankan!`}
+                    {primaryOee >= 0.65 && primaryOee < 0.85 && `✅ TYPICAL. ${primaryLabel} ${pct(primaryOee)} dalam range normal. Ada ruang untuk improvement.`}
+                    {primaryOee >= 0.4 && primaryOee < 0.65 && `📊 PERLU PERHATIAN. ${primaryLabel} ${pct(primaryOee)} di bawah rata-rata. Fokus pada ${availability < 0.85 ? 'downtime reduction' : performanceDisplay < 0.85 ? 'speed optimization' : 'quality improvement'}.`}
+                    {primaryOee < 0.4 && `⚠️ URGENT! ${primaryLabel} sangat rendah. Perlu investigasi Availability, Performance, dan Quality.`}
                   </p>
                 </>
               )}
@@ -1327,3 +1333,7 @@ export function ProductionKpiPanel({
     </div>
   );
 }
+
+
+
+
